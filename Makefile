@@ -3,39 +3,53 @@ DB_DIR  := $(CURDIR)/data
 DB_FILE := /data/content_catalogue.duckdb
 BUCKET  := bitmovin-api-eu-west1-ci-input
 
-# AWS credentials — set AWS_PROFILE or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_DEFAULT_REGION
+# AWS credentials — set AWS_PROFILE or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
 ifdef AWS_PROFILE
 AWS_FLAGS := -v "$(HOME)/.aws:/root/.aws:ro" -e AWS_PROFILE=$(AWS_PROFILE)
 PROFILE_ARG := --profile $(AWS_PROFILE)
-else
+else ifdef AWS_ACCESS_KEY_ID
 AWS_FLAGS := \
 	-e AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY_ID) \
 	-e AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY) \
 	-e AWS_DEFAULT_REGION=$(or $(AWS_DEFAULT_REGION),eu-west-1)
 PROFILE_ARG :=
+else
+AWS_FLAGS := __missing__
+PROFILE_ARG :=
 endif
+
+define CREDS_ERROR
+No AWS credentials found. Set one of:
+  export AWS_PROFILE=my-profile
+  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=eu-west-1
+endef
 
 DOCKER_RUN := docker run --rm \
 	$(AWS_FLAGS) \
 	-v "$(DB_DIR):/data" \
 	$(IMAGE)
 
-.PHONY: build inventory metadata both summary query shell help
+.PHONY: build inventory metadata both summary query shell help check-auth
+
+check-auth:
+ifeq ($(AWS_FLAGS),__missing__)
+	$(error $(CREDS_ERROR))
+endif
 
 ## Build the Docker image
 build:
 	docker build -t $(IMAGE) .
 
 ## Phase 1 — list all video and audio files in the bucket
-inventory: $(DB_DIR)
+inventory: check-auth $(DB_DIR)
 	$(DOCKER_RUN) --phase inventory --bucket $(BUCKET) --db $(DB_FILE) $(PROFILE_ARG) $(ARGS)
 
 ## Phase 2 — extract metadata via ffprobe (resumes from where it left off)
-metadata: $(DB_DIR)
+metadata: check-auth $(DB_DIR)
 	$(DOCKER_RUN) --phase metadata --bucket $(BUCKET) --db $(DB_FILE) $(PROFILE_ARG) $(ARGS)
 
 ## Run both phases in sequence
-both: $(DB_DIR)
+both: check-auth $(DB_DIR)
 	$(DOCKER_RUN) --phase both --bucket $(BUCKET) --db $(DB_FILE) $(PROFILE_ARG) $(ARGS)
 
 ## Print a summary of what has been collected so far
