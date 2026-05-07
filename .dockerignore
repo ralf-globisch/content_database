@@ -1,0 +1,5 @@
+*.duckdb
+*.txt.bak
+__pycache__/
+*.pyc
+.env
