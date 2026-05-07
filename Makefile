@@ -14,11 +14,6 @@ else
 PROFILE_ARG :=
 endif
 
-define CREDS_ERROR
-No ~/.aws directory found. Set up credentials with:
-  aws configure
-or export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=eu-west-1
-endef
 
 DOCKER_RUN := docker run --rm \
 	$(AWS_FLAGS) \
@@ -28,7 +23,7 @@ DOCKER_RUN := docker run --rm \
 .PHONY: build inventory metadata both summary query shell help check-auth
 
 check-auth:
-	@test -d $(HOME)/.aws || (echo "$(CREDS_ERROR)" && exit 1)
+	@test -d $(HOME)/.aws || { echo "No ~/.aws directory found. Run: aws configure"; exit 1; }
 
 ## Build the Docker image
 build:
