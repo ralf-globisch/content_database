@@ -3,25 +3,21 @@ DB_DIR  := $(CURDIR)/data
 DB_FILE := /data/content_catalogue.duckdb
 BUCKET  := bitmovin-api-eu-west1-ci-input
 
-# AWS credentials — set AWS_PROFILE or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
-ifdef AWS_PROFILE
-AWS_FLAGS := -v "$(HOME)/.aws:/root/.aws:ro" -e AWS_PROFILE=$(AWS_PROFILE)
-PROFILE_ARG := --profile $(AWS_PROFILE)
-else ifdef AWS_ACCESS_KEY_ID
-AWS_FLAGS := \
-	-e AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY_ID) \
-	-e AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY) \
+# AWS credentials — mounts ~/.aws so all credential types work (keys, assumed roles, SSO)
+# Override the profile with: export AWS_PROFILE=my-profile
+AWS_FLAGS := -v "$(HOME)/.aws:/root/.aws:ro" \
 	-e AWS_DEFAULT_REGION=$(or $(AWS_DEFAULT_REGION),eu-west-1)
-PROFILE_ARG :=
+ifdef AWS_PROFILE
+AWS_FLAGS += -e AWS_PROFILE=$(AWS_PROFILE)
+PROFILE_ARG := --profile $(AWS_PROFILE)
 else
-AWS_FLAGS := __missing__
 PROFILE_ARG :=
 endif
 
 define CREDS_ERROR
-No AWS credentials found. Set one of:
-  export AWS_PROFILE=my-profile
-  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=eu-west-1
+No ~/.aws directory found. Set up credentials with:
+  aws configure
+or export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=eu-west-1
 endef
 
 DOCKER_RUN := docker run --rm \
@@ -32,9 +28,7 @@ DOCKER_RUN := docker run --rm \
 .PHONY: build inventory metadata both summary query shell help check-auth
 
 check-auth:
-ifeq ($(AWS_FLAGS),__missing__)
-	$(error $(CREDS_ERROR))
-endif
+	@test -d $(HOME)/.aws || (echo "$(CREDS_ERROR)" && exit 1)
 
 ## Build the Docker image
 build:

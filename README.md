@@ -26,10 +26,9 @@ Inventories video and audio files in an S3 bucket, extracts technical metadata v
 # 1. Build the image
 make build
 
-# 2. Set AWS credentials
+# 2. AWS credentials are read automatically from ~/.aws (assumed roles, SSO, and long-term keys all work)
+# To use a specific profile:
 export AWS_PROFILE=my-profile
-# or
-export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=eu-west-1
 
 # 3. Inventory all media files in the bucket (Phase 1)
 make inventory
@@ -182,26 +181,28 @@ audio_tracks       — one row per audio stream per file (multi-track support)
 
 ## Docker without Make
 
+`~/.aws` is always mounted read-only so all credential types work automatically.
+
 ```bash
 # Build
 docker build -t content-catalogue .
 
-# Run with AWS profile
+# Run (credentials from ~/.aws default profile)
 docker run --rm \
   -v "$HOME/.aws:/root/.aws:ro" \
-  -e AWS_PROFILE=my-profile \
-  -v "$PWD/data:/data" \
-  content-catalogue \
-  --phase both --db /data/content_catalogue.duckdb --profile my-profile
-
-# Run with explicit credentials
-docker run --rm \
-  -e AWS_ACCESS_KEY_ID=... \
-  -e AWS_SECRET_ACCESS_KEY=... \
   -e AWS_DEFAULT_REGION=eu-west-1 \
   -v "$PWD/data:/data" \
   content-catalogue \
   --phase both --db /data/content_catalogue.duckdb
+
+# Run with a specific profile
+docker run --rm \
+  -v "$HOME/.aws:/root/.aws:ro" \
+  -e AWS_DEFAULT_REGION=eu-west-1 \
+  -e AWS_PROFILE=my-profile \
+  -v "$PWD/data:/data" \
+  content-catalogue \
+  --phase both --db /data/content_catalogue.duckdb --profile my-profile
 ```
 
 ## All CLI options
