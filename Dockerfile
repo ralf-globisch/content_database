@@ -10,6 +10,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY catalogue.py .
+COPY catalogue.py app.py queries.yaml ./
 
 ENTRYPOINT ["python", "catalogue.py"]

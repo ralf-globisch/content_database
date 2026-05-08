@@ -1,0 +1,203 @@
+summary:
+  label: "Summary — counts and sizes by media type"
+  sql: |
+    SELECT
+      media_type,
+      count(*)                              AS files,
+      round(sum(size_bytes)  / 1e9, 2)     AS total_gb,
+      round(avg(size_bytes)  / 1e6, 1)     AS avg_mb
+    FROM media_files
+    GROUP BY 1
+    ORDER BY 2 DESC
+
+by_video_codec:
+  label: "Video — by codec (summary)"
+  sql: |
+    SELECT
+      video_codec,
+      count(*)                             AS files,
+      round(avg(width),  0)::INT           AS avg_width,
+      round(avg(height), 0)::INT           AS avg_height,
+      round(avg(fps),    2)                AS avg_fps,
+      round(avg(video_bitrate) / 1e6, 2)  AS avg_bitrate_mbps
+    FROM media_metadata
+    WHERE video_codec IS NOT NULL
+    GROUP BY 1
+    ORDER BY 2 DESC
+
+files_by_codec:
+  label: "Video — files by codec (detail)"
+  sql: |
+    SELECT
+      f.s3_key,
+      m.video_codec,
+      m.width::TEXT || 'x' || m.height::TEXT  AS resolution,
+      round(m.fps, 2)                          AS fps,
+      round(m.video_bitrate / 1e6, 2)          AS bitrate_mbps,
+      round(m.duration_s, 1)                   AS duration_s,
+      round(f.size_bytes / 1e6, 1)             AS size_mb
+    FROM media_metadata m
+    JOIN media_files f USING (s3_key)
+    WHERE m.video_codec IS NOT NULL
+    ORDER BY f.size_bytes DESC
+
+by_resolution:
+  label: "Video — by resolution (summary)"
+  sql: |
+    SELECT
+      width::TEXT || 'x' || height::TEXT   AS resolution,
+      video_codec,
+      count(*)                             AS files
+    FROM media_metadata
+    WHERE width IS NOT NULL
+    GROUP BY 1, 2
+    ORDER BY 3 DESC
+
+files_by_resolution:
+  label: "Video — files by resolution (detail)"
+  sql: |
+    SELECT
+      f.s3_key,
+      m.width::TEXT || 'x' || m.height::TEXT  AS resolution,
+      m.video_codec,
+      round(m.fps, 2)                          AS fps,
+      round(m.video_bitrate / 1e6, 2)          AS bitrate_mbps,
+      round(m.duration_s, 1)                   AS duration_s,
+      round(f.size_bytes / 1e6, 1)             AS size_mb,
+      f.top_prefix
+    FROM media_metadata m
+    JOIN media_files f USING (s3_key)
+    WHERE m.width IS NOT NULL
+    ORDER BY m.width DESC, m.height DESC, f.s3_key
+
+hdr:
+  label: "HDR and Dolby Vision (summary)"
+  sql: |
+    SELECT
+      hdr_format,
+      dolby_vision,
+      dv_profile,
+      dv_level,
+      color_primaries,
+      color_transfer,
+      count(*)  AS files
+    FROM media_metadata
+    WHERE hdr_format IS NOT NULL OR dolby_vision = true
+    GROUP BY 1, 2, 3, 4, 5, 6
+    ORDER BY 7 DESC
+
+files_hdr:
+  label: "HDR and Dolby Vision — files (detail)"
+  sql: |
+    SELECT
+      f.s3_key,
+      m.hdr_format,
+      m.dolby_vision,
+      m.dv_profile,
+      m.dv_level,
+      m.color_primaries,
+      m.color_transfer,
+      m.video_codec,
+      m.width::TEXT || 'x' || m.height::TEXT  AS resolution,
+      round(f.size_bytes / 1e6, 1)             AS size_mb
+    FROM media_metadata m
+    JOIN media_files f USING (s3_key)
+    WHERE m.hdr_format IS NOT NULL OR m.dolby_vision = true
+    ORDER BY m.dolby_vision DESC, m.hdr_format, f.s3_key
+
+dolby_atmos:
+  label: "Dolby Atmos — tracks (detail)"
+  sql: |
+    SELECT
+      f.s3_key,
+      a.track_index,
+      a.codec,
+      a.channels,
+      a.language,
+      a.dolby_codec_family,
+      round(f.size_bytes / 1e6, 1)  AS size_mb
+    FROM audio_tracks a
+    JOIN media_files f USING (s3_key)
+    WHERE a.dolby_atmos = true
+    ORDER BY f.s3_key, a.track_index
+
+audio_by_language:
+  label: "Audio — by language (summary)"
+  sql: |
+    SELECT
+      language,
+      codec,
+      channels,
+      count(*)  AS tracks
+    FROM audio_tracks
+    GROUP BY 1, 2, 3
+    ORDER BY 4 DESC
+
+files_by_language:
+  label: "Audio — files by language (detail)"
+  sql: |
+    SELECT
+      f.s3_key,
+      a.language,
+      a.codec,
+      a.channels,
+      a.dolby_atmos,
+      a.dolby_codec_family,
+      round(f.size_bytes / 1e6, 1)  AS size_mb
+    FROM audio_tracks a
+    JOIN media_files f USING (s3_key)
+    ORDER BY a.language, f.s3_key, a.track_index
+
+errors:
+  label: "Files with probe errors"
+  sql: |
+    SELECT
+      f.s3_key,
+      round(f.size_bytes / 1e6, 1)  AS size_mb,
+      m.error
+    FROM media_metadata m
+    JOIN media_files f USING (s3_key)
+    WHERE m.error IS NOT NULL
+    ORDER BY f.size_bytes DESC
+
+largest_files:
+  label: "Largest files (top 100)"
+  sql: |
+    SELECT
+      f.s3_key,
+      round(f.size_bytes / 1e6, 1)             AS size_mb,
+      m.video_codec,
+      m.width::TEXT || 'x' || m.height::TEXT   AS resolution,
+      round(m.duration_s, 1)                   AS duration_s,
+      f.extension,
+      f.top_prefix
+    FROM media_files f
+    LEFT JOIN media_metadata m USING (s3_key)
+    ORDER BY f.size_bytes DESC
+    LIMIT 100
+
+by_prefix:
+  label: "Content by top-level prefix (summary)"
+  sql: |
+    SELECT
+      top_prefix,
+      count(*)                          AS files,
+      round(sum(size_bytes) / 1e9, 2)  AS total_gb
+    FROM media_files
+    GROUP BY 1
+    ORDER BY 2 DESC
+
+files_by_prefix:
+  label: "Content by top-level prefix (detail)"
+  sql: |
+    SELECT
+      f.s3_key,
+      f.top_prefix,
+      f.extension,
+      round(f.size_bytes / 1e6, 1)             AS size_mb,
+      m.video_codec,
+      m.width::TEXT || 'x' || m.height::TEXT   AS resolution,
+      round(m.duration_s, 1)                   AS duration_s
+    FROM media_files f
+    LEFT JOIN media_metadata m USING (s3_key)
+    ORDER BY f.top_prefix, f.size_bytes DESC

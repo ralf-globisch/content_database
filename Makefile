@@ -20,7 +20,7 @@ DOCKER_RUN := docker run --rm \
 	-v "$(DB_DIR):/data" \
 	$(IMAGE)
 
-.PHONY: build inventory metadata both summary query shell help check-auth
+.PHONY: build inventory metadata both summary query shell ui help check-auth
 
 check-auth:
 	@test -d $(HOME)/.aws || { echo "No ~/.aws directory found. Run: aws configure"; exit 1; }
@@ -48,11 +48,25 @@ summary: $(DB_DIR)
 ## Run a SQL query against the local database
 ## Usage: make query Q="SELECT count(*) FROM media_files"
 query: $(DB_DIR)
-	duckdb $(DB_DIR)/content_catalogue.duckdb "$(Q)"
+ifndef Q
+	$(error Usage: make query Q="SELECT ...")
+endif
+	docker run --rm -v "$(DB_DIR):/data" --entrypoint python $(IMAGE) \
+		-c "import duckdb,sys; print(duckdb.connect(sys.argv[1],read_only=True).execute(sys.argv[2]).df().to_string(index=False))" \
+		$(DB_FILE) "$(Q)"
 
 ## Open an interactive DuckDB shell against the local database
 shell: $(DB_DIR)
-	duckdb $(DB_DIR)/content_catalogue.duckdb
+	docker run --rm -it -v "$(DB_DIR):/data" \
+		--entrypoint python $(IMAGE) -m duckdb $(DB_FILE)
+
+## Open the Streamlit query UI (http://localhost:8501)
+ui: $(DB_DIR)
+	docker run --rm -it -p 8501:8501 -v "$(DB_DIR):/data" \
+		--entrypoint streamlit $(IMAGE) \
+		run /app/app.py \
+		--server.address=0.0.0.0 \
+		--server.headless=true
 
 $(DB_DIR):
 	mkdir -p $(DB_DIR)
@@ -67,6 +81,7 @@ help:
 	@echo "  make summary                        Print collected stats"
 	@echo "  make query Q=\"<sql>\"                 Run a SQL query on the DB"
 	@echo "  make shell                          Open interactive DuckDB shell"
+	@echo "  make ui                             Open Streamlit query UI (http://localhost:8501)"
 	@echo ""
 	@echo "AWS credentials (pick one):"
 	@echo "  export AWS_PROFILE=my-profile"
