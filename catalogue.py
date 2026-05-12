@@ -7,11 +7,14 @@ Phase 2: Extract media attributes via ffprobe on presigned URLs
 """
 
 import argparse
+import base64
 import json
 import logging
+import os
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 import boto3
 import duckdb
@@ -97,6 +100,17 @@ def init_db(db_path: str) -> duckdb.DuckDBPyConnection:
             dolby_atmos        BOOLEAN,
             dolby_codec_family TEXT,
             PRIMARY KEY (s3_key, track_index)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS content_vision (
+            s3_key      TEXT PRIMARY KEY,
+            description TEXT,
+            style       TEXT,
+            has_credits BOOLEAN,
+            brightness  TEXT,
+            genre_tags  VARCHAR[],
+            analyzed_at TEXT
         )
     """)
     return con
@@ -444,6 +458,178 @@ def run_metadata_phase(
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 — vision analysis via Ollama
+# ---------------------------------------------------------------------------
+
+OLLAMA_HOST         = os.environ.get("OLLAMA_HOST",         "http://localhost:11434")
+OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "llava")
+OLLAMA_SQL_MODEL    = os.environ.get("OLLAMA_SQL_MODEL",    "llama3.2")
+
+_VISION_PROMPT = """\
+Look at these video frames and respond with ONLY a JSON object — no markdown, no explanation.
+
+{
+  "description": "2-3 sentence description of what this content appears to be",
+  "style": "live_action or animated or cgi or mixed",
+  "has_credits": true or false,
+  "brightness": "bright or normal or dark or mixed",
+  "genre_tags": ["tag1", "tag2"]
+}
+
+genre_tags: pick 1-5 from: action, drama, comedy, documentary, sports, news, animation, \
+nature, music, commercial, trailer, educational, gaming, film.
+The last frame may show ending credits — look for dense text overlays."""
+
+
+def _extract_json(text: str) -> dict:
+    """Pull a JSON object out of model output that may contain surrounding text."""
+    if "```" in text:
+        for block in text.split("```")[1::2]:
+            candidate = block.lstrip("json\n").strip()
+            if candidate.startswith("{"):
+                text = candidate
+                break
+    start, end = text.find("{"), text.rfind("}") + 1
+    if start >= 0 and end > start:
+        return json.loads(text[start:end])
+    raise ValueError(f"No JSON object in model output: {text[:300]!r}")
+
+
+def extract_frame_base64(url: str, offset_s: float) -> str | None:
+    """Extract one JPEG frame at offset_s seconds from a URL, return base64 or None."""
+    cmd = [
+        "ffmpeg", "-v", "quiet",
+        "-ss", str(int(offset_s)),
+        "-i", url,
+        "-frames:v", "1",
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
+        "-q:v", "5",
+        "-vf", "scale=480:-1",
+        "pipe:1",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=60)
+        if r.returncode != 0 or not r.stdout:
+            return None
+        return base64.b64encode(r.stdout).decode()
+    except Exception:
+        return None
+
+
+def analyze_frames(frames_b64: list[str], filename: str) -> dict:
+    """Classify video frames using the Ollama vision model, return parsed JSON."""
+    try:
+        import ollama
+    except ImportError:
+        raise RuntimeError("pip install ollama")
+
+    client = ollama.Client(host=OLLAMA_HOST)
+    resp = client.chat(
+        model=OLLAMA_VISION_MODEL,
+        messages=[{
+            "role": "user",
+            "content": f"File: {filename}\n\n{_VISION_PROMPT}",
+            "images": frames_b64,
+        }],
+    )
+    return _extract_json(resp.message.content)
+
+
+def already_vision_analyzed(con: duckdb.DuckDBPyConnection) -> set[str]:
+    return {r[0] for r in con.execute("SELECT s3_key FROM content_vision").fetchall()}
+
+
+def vision_one(
+    s3_client, bucket: str, key: str, duration_s: float | None
+) -> tuple[str, dict]:
+    try:
+        url = presign(s3_client, bucket, key)
+        if duration_s and duration_s > 20:
+            offsets = [duration_s * p for p in (0.10, 0.30, 0.55, 0.80, 0.92)]
+        else:
+            offsets = [2.0, 5.0, 10.0, 20.0, 30.0]
+
+        frames = [f for offset in offsets if (f := extract_frame_base64(url, offset))]
+        if not frames:
+            raise RuntimeError("No frames extracted")
+        result = analyze_frames(frames, key.rsplit("/", 1)[-1])
+        return key, result
+    except Exception as exc:
+        return key, {"_error": str(exc)[:500]}
+
+
+def run_vision_phase(
+    con: duckdb.DuckDBPyConnection,
+    bucket: str,
+    profile: str | None,
+    workers: int,
+    limit: int | None,
+) -> None:
+    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    s3 = session.client("s3")
+
+    done = already_vision_analyzed(con)
+    rows = con.execute("""
+        SELECT f.s3_key, m.duration_s
+        FROM media_files f
+        LEFT JOIN media_metadata m USING (s3_key)
+        WHERE f.media_type = 'video'
+    """).fetchall()
+
+    todo = [(key, dur) for key, dur in rows if key not in done]
+    if limit:
+        todo = todo[:limit]
+
+    log.info("Vision analysis: %d video files, %d workers", len(todo), workers)
+
+    batch: list[tuple] = []
+
+    def flush() -> None:
+        if batch:
+            con.executemany(
+                """
+                INSERT OR REPLACE INTO content_vision
+                    (s3_key, description, style, has_credits, brightness, genre_tags, analyzed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                batch,
+            )
+            batch.clear()
+
+    now = datetime.now(timezone.utc).isoformat()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(vision_one, s3, bucket, key, dur): key for key, dur in todo}
+        for i, future in enumerate(as_completed(futures), 1):
+            key, result = future.result()
+            if "_error" in result:
+                log.warning("[%d/%d] ERR %s: %s", i, len(todo), key, result["_error"])
+                continue
+            batch.append((
+                key,
+                result.get("description"),
+                result.get("style"),
+                result.get("has_credits"),
+                result.get("brightness"),
+                result.get("genre_tags") or [],
+                now,
+            ))
+            log.info(
+                "[%d/%d] OK  style=%-11s credits=%-5s brightness=%-6s  %s",
+                i, len(todo),
+                result.get("style", "?"),
+                result.get("has_credits"),
+                result.get("brightness", "?"),
+                key.rsplit("/", 1)[-1],
+            )
+            if len(batch) >= 10:
+                flush()
+
+    flush()
+    log.info("Vision phase complete.")
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
@@ -543,7 +729,8 @@ def main() -> None:
     parser.add_argument("--profile", default=None, help="AWS profile name")
     parser.add_argument("--workers", type=int, default=20, help="Parallel ffprobe workers")
     parser.add_argument(
-        "--phase", choices=["inventory", "metadata", "both", "summary"],
+        "--phase",
+        choices=["inventory", "metadata", "vision", "both", "summary"],
         default="both",
     )
     parser.add_argument("--limit", type=int, default=None,
@@ -558,6 +745,10 @@ def main() -> None:
 
     if args.phase in ("metadata", "both"):
         run_metadata_phase(con, args.bucket, args.profile, args.workers, args.limit)
+
+    if args.phase == "vision":
+        vision_workers = min(args.workers, 5)  # respect Claude API rate limits
+        run_vision_phase(con, args.bucket, args.profile, vision_workers, args.limit)
 
     if args.phase in ("summary", "both"):
         print_summary(con)

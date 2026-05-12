@@ -201,3 +201,78 @@ files_by_prefix:
     FROM media_files f
     LEFT JOIN media_metadata m USING (s3_key)
     ORDER BY f.top_prefix, f.size_bytes DESC
+
+vision_summary:
+  label: "Vision — content style summary"
+  sql: |
+    SELECT
+      style,
+      brightness,
+      count(*)                                AS files,
+      sum(CASE WHEN has_credits THEN 1 ELSE 0 END) AS with_credits
+    FROM content_vision
+    GROUP BY style, brightness
+    ORDER BY files DESC
+
+vision_animated:
+  label: "Vision — animated content"
+  sql: |
+    SELECT
+      v.s3_key,
+      v.style,
+      v.brightness,
+      v.genre_tags,
+      v.description,
+      round(f.size_bytes / 1e6, 1)  AS size_mb
+    FROM content_vision v
+    JOIN media_files f USING (s3_key)
+    WHERE v.style IN ('animated', 'cgi')
+    ORDER BY f.size_bytes DESC
+
+vision_credits:
+  label: "Vision — files with ending credits"
+  sql: |
+    SELECT
+      v.s3_key,
+      v.style,
+      v.genre_tags,
+      v.description,
+      round(f.size_bytes / 1e6, 1)  AS size_mb,
+      round(m.duration_s, 1)        AS duration_s
+    FROM content_vision v
+    JOIN media_files f USING (s3_key)
+    LEFT JOIN media_metadata m USING (s3_key)
+    WHERE v.has_credits = true
+    ORDER BY f.size_bytes DESC
+
+vision_dark:
+  label: "Vision — dark / low-light content"
+  sql: |
+    SELECT
+      v.s3_key,
+      v.style,
+      v.genre_tags,
+      v.description,
+      m.hdr_format,
+      round(f.size_bytes / 1e6, 1)  AS size_mb
+    FROM content_vision v
+    JOIN media_files f USING (s3_key)
+    LEFT JOIN media_metadata m USING (s3_key)
+    WHERE v.brightness = 'dark'
+    ORDER BY f.size_bytes DESC
+
+vision_all:
+  label: "Vision — all analyzed files"
+  sql: |
+    SELECT
+      v.s3_key,
+      v.style,
+      v.brightness,
+      v.has_credits,
+      v.genre_tags,
+      v.description,
+      round(f.size_bytes / 1e6, 1)  AS size_mb,
+      v.analyzed_at
+    FROM content_vision v
+    JOIN media_files f USING (s3_key)
+    ORDER BY v.analyzed_at DESC
