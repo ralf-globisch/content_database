@@ -15,10 +15,15 @@ PROFILE_ARG :=
 endif
 
 # Ollama — vision runs on host directly; UI passes these through for NL search in the browser
-OLLAMA_HOST  ?= http://localhost:11434
+OLLAMA_HOST         ?= http://localhost:11434
+OLLAMA_VISION_MODEL ?= moondream   # CPU default; override with llava for GPU hosts
+OLLAMA_SQL_MODEL    ?= llama3.2
 OLLAMA_FLAGS := -e OLLAMA_HOST=$(OLLAMA_HOST) \
-	-e OLLAMA_VISION_MODEL=$(or $(OLLAMA_VISION_MODEL),llava) \
-	-e OLLAMA_SQL_MODEL=$(or $(OLLAMA_SQL_MODEL),llama3.2)
+	-e OLLAMA_VISION_MODEL=$(OLLAMA_VISION_MODEL) \
+	-e OLLAMA_SQL_MODEL=$(OLLAMA_SQL_MODEL)
+
+# Python interpreter for the vision phase (runs on host, not in Docker)
+PYTHON ?= python3
 
 DOCKER_RUN := docker run --rm \
 	$(AWS_FLAGS) \
@@ -48,14 +53,16 @@ inventory: check-auth $(DB_DIR)
 metadata: check-auth $(DB_DIR)
 	$(DOCKER_RUN) --phase metadata --bucket $(BUCKET) --db $(DB_FILE) $(PROFILE_ARG) $(ARGS)
 
-## Phase 3 — analyse video frames with Ollama llava (runs on host, not Docker)
-## Requires: pip install ollama boto3 duckdb  +  ollama pull llava
+## Phase 3 — analyse video frames with Ollama (runs on host, not Docker)
+## Requires: pip install ollama boto3 duckdb  +  ollama pull moondream llama3.2
+## Override models: OLLAMA_VISION_MODEL=llava make vision  (e.g. on GPU hosts)
+## Override python: PYTHON=/path/to/venv/bin/python make vision
 vision: check-auth $(DB_DIR)
 	OLLAMA_HOST=$(OLLAMA_HOST) \
-	OLLAMA_VISION_MODEL=$(or $(OLLAMA_VISION_MODEL),llava) \
-	OLLAMA_SQL_MODEL=$(or $(OLLAMA_SQL_MODEL),llama3.2) \
+	OLLAMA_VISION_MODEL=$(OLLAMA_VISION_MODEL) \
+	OLLAMA_SQL_MODEL=$(OLLAMA_SQL_MODEL) \
 	$(or $(AWS_PROFILE:%=AWS_PROFILE=%),) \
-	python3 catalogue.py --phase vision --bucket $(BUCKET) --db $(CURDIR)/data/content_catalogue.duckdb $(PROFILE_ARG) $(ARGS)
+	$(PYTHON) catalogue.py --phase vision --bucket $(BUCKET) --db $(CURDIR)/data/content_catalogue.duckdb $(PROFILE_ARG) $(ARGS)
 
 ## Run both phases in sequence
 both: check-auth $(DB_DIR)
@@ -112,10 +119,11 @@ help:
 	@echo "  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=..."
 	@echo ""
 	@echo "Ollama (required for 'vision' and NL search in UI):"
-	@echo "  ollama pull llava      # vision model (~4 GB)"
-	@echo "  ollama pull llama3.2   # SQL generation model (~2 GB)"
-	@echo "  Override host: OLLAMA_HOST=http://other-host:11434 make vision"
-	@echo "  Swap models:   OLLAMA_VISION_MODEL=llava-llama3 make vision"
+	@echo "  ollama pull moondream  # vision model, CPU-friendly (~800 MB)"
+	@echo "  ollama pull llama3.2   # SQL/structure model (~2 GB)"
+	@echo "  Override host:   OLLAMA_HOST=http://other-host:11434 make vision"
+	@echo "  Override models: OLLAMA_VISION_MODEL=llava make vision  (GPU hosts)"
+	@echo "  Override python: PYTHON=/path/to/venv/bin/python make vision"
 	@echo ""
 	@echo "Optional ARGS examples:"
 	@echo "  ARGS=\"--prefix analysis/jan-ozer-per-title-files/\"   scope to a prefix"
