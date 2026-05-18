@@ -28,7 +28,13 @@ DOCKER_RUN := docker run --rm \
 .PHONY: build inventory metadata vision both summary query shell ui help check-auth
 
 check-auth:
-	@test -d $(HOME)/.aws || { echo "No ~/.aws directory found. Run: aws configure"; exit 1; }
+	@aws sts get-caller-identity > /dev/null || \
+		{ echo ""; \
+		  echo "ERROR: AWS credentials are missing or expired."; \
+		  echo "  For SSO:         aws sso login"; \
+		  echo "  For access keys: aws configure"; \
+		  echo "  For env vars:    export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=..."; \
+		  echo ""; exit 1; }
 
 ## Build the Docker image
 build:

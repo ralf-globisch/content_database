@@ -192,6 +192,23 @@ def _s3_client(profile: str | None):
     return session.client("s3", config=Config(signature_version="s3v4"))
 
 
+def _check_aws_auth(profile: str | None) -> None:
+    """Fail fast with a clear message if AWS credentials are missing or expired."""
+    try:
+        session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+        identity = session.client("sts").get_caller_identity()
+        log.info("AWS auth OK — account=%s  arn=%s", identity["Account"], identity["Arn"])
+    except Exception as exc:
+        msg = str(exc)
+        if "ExpiredToken" in msg or "expired" in msg.lower():
+            hint = "credentials have expired — refresh with: aws sso login"
+        elif "NoCredentialProviders" in msg or "Unable to locate credentials" in msg:
+            hint = "no credentials found — run: aws configure  or set AWS_ACCESS_KEY_ID"
+        else:
+            hint = f"run: aws sts get-caller-identity  to debug ({msg})"
+        raise SystemExit(f"ERROR: AWS auth failed — {hint}") from None
+
+
 def presign(s3_client, bucket: str, key: str) -> str:
     return s3_client.generate_presigned_url(
         "get_object",
@@ -909,6 +926,9 @@ def main() -> None:
     args = parser.parse_args()
 
     con = init_db(args.db)
+
+    if args.phase in ("inventory", "metadata", "vision", "both"):
+        _check_aws_auth(args.profile)
 
     if args.phase in ("inventory", "both"):
         media = list_media_files(args.bucket, args.prefix, args.profile)
