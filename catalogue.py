@@ -494,6 +494,7 @@ def run_metadata_phase(
 OLLAMA_HOST         = os.environ.get("OLLAMA_HOST",         "http://localhost:11434")
 OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "moondream")
 OLLAMA_SQL_MODEL    = os.environ.get("OLLAMA_SQL_MODEL",    "llama3.2")
+DOCKER_IMAGE        = os.environ.get("DOCKER_IMAGE",        "content-catalogue")
 
 HASH_MATCH_THRESHOLD = 10  # max dHash bit distance (out of 64) to consider files same-source
 
@@ -539,7 +540,7 @@ def extract_frame_base64(url: str, offset_s: float) -> str | None:
     """Extract one JPEG frame at offset_s seconds from a URL, return base64 or None."""
     cmd = [
         "docker", "run", "--rm", "--entrypoint", "ffmpeg",
-        "content-catalogue",
+        DOCKER_IMAGE,
         "-v", "quiet",
         "-ss", str(int(offset_s)),
         "-i", url,

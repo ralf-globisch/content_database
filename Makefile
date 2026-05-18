@@ -61,6 +61,7 @@ vision: check-auth $(DB_DIR)
 	OLLAMA_HOST=$(OLLAMA_HOST) \
 	OLLAMA_VISION_MODEL=$(OLLAMA_VISION_MODEL) \
 	OLLAMA_SQL_MODEL=$(OLLAMA_SQL_MODEL) \
+	DOCKER_IMAGE=$(IMAGE) \
 	$(or $(AWS_PROFILE:%=AWS_PROFILE=%),) \
 	$(PYTHON) catalogue.py --phase vision --bucket $(BUCKET) --db $(CURDIR)/data/content_catalogue.duckdb $(PROFILE_ARG) $(ARGS)
 
