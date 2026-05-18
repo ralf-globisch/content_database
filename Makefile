@@ -14,10 +14,9 @@ else
 PROFILE_ARG :=
 endif
 
-# Ollama — runs on the host; host.docker.internal resolves via --add-host on Linux
-OLLAMA_HOST     ?= http://host.docker.internal:11434
-OLLAMA_FLAGS    := --add-host=host.docker.internal:host-gateway \
-	-e OLLAMA_HOST=$(OLLAMA_HOST) \
+# Ollama — vision runs on host directly; UI passes these through for NL search in the browser
+OLLAMA_HOST  ?= http://localhost:11434
+OLLAMA_FLAGS := -e OLLAMA_HOST=$(OLLAMA_HOST) \
 	-e OLLAMA_VISION_MODEL=$(or $(OLLAMA_VISION_MODEL),llava) \
 	-e OLLAMA_SQL_MODEL=$(or $(OLLAMA_SQL_MODEL),llama3.2)
 
@@ -43,14 +42,14 @@ inventory: check-auth $(DB_DIR)
 metadata: check-auth $(DB_DIR)
 	$(DOCKER_RUN) --phase metadata --bucket $(BUCKET) --db $(DB_FILE) $(PROFILE_ARG) $(ARGS)
 
-## Phase 3 — analyse video frames with Ollama llava (resumes from where it left off)
-## Requires Ollama running on host with: ollama pull llava
+## Phase 3 — analyse video frames with Ollama llava (runs on host, not Docker)
+## Requires: pip install ollama boto3 duckdb  +  ollama pull llava
 vision: check-auth $(DB_DIR)
-	docker run --rm \
-		$(AWS_FLAGS) $(OLLAMA_FLAGS) \
-		-v "$(DB_DIR):/data" \
-		$(IMAGE) \
-		--phase vision --bucket $(BUCKET) --db $(DB_FILE) $(PROFILE_ARG) $(ARGS)
+	OLLAMA_HOST=$(OLLAMA_HOST) \
+	OLLAMA_VISION_MODEL=$(or $(OLLAMA_VISION_MODEL),llava) \
+	OLLAMA_SQL_MODEL=$(or $(OLLAMA_SQL_MODEL),llama3.2) \
+	$(or $(AWS_PROFILE:%=AWS_PROFILE=%),) \
+	python3 catalogue.py --phase vision --bucket $(BUCKET) --db $(CURDIR)/data/content_catalogue.duckdb $(PROFILE_ARG) $(ARGS)
 
 ## Run both phases in sequence
 both: check-auth $(DB_DIR)
