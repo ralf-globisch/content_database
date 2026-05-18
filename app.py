@@ -3,17 +3,27 @@ import duckdb
 import streamlit as st
 import yaml
 
-DB_PATH      = os.environ.get("DB_PATH",      "/data/content_catalogue.duckdb")
-QUERIES_PATH = os.environ.get("QUERIES_PATH", "/app/queries.yaml")
-OLLAMA_HOST  = os.environ.get("OLLAMA_HOST",  "http://localhost:11434")
-SQL_MODEL    = os.environ.get("OLLAMA_SQL_MODEL", "llama3.2")
-PAGE_SIZE    = 200
+DB_PATH           = os.environ.get("DB_PATH",           "/data/content_catalogue.duckdb")
+QUERIES_PATH      = os.environ.get("QUERIES_PATH",      "/app/queries.yaml")
+OLLAMA_HOST       = os.environ.get("OLLAMA_HOST",       "http://localhost:11434")
+SQL_MODEL         = os.environ.get("OLLAMA_SQL_MODEL",  "llama3.2")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+CLAUDE_SQL_MODEL  = os.environ.get("CLAUDE_SQL_MODEL",  "claude-haiku-4-5-20251001")
+PAGE_SIZE         = 200
+
+try:
+    import anthropic as _anthropic
+    HAS_CLAUDE = bool(ANTHROPIC_API_KEY)
+except ImportError:
+    HAS_CLAUDE = False
 
 try:
     import ollama as _ollama
     HAS_OLLAMA = True
 except ImportError:
     HAS_OLLAMA = False
+
+HAS_NL = HAS_CLAUDE or HAS_OLLAMA
 
 _NL_SCHEMA = """Convert the user's natural language request into a DuckDB SQL SELECT statement.
 
@@ -52,6 +62,23 @@ Rules:
 
 
 def _generate_sql(nl_query: str) -> str:
+    if HAS_CLAUDE:
+        return _generate_sql_claude(nl_query)
+    return _generate_sql_ollama(nl_query)
+
+
+def _generate_sql_claude(nl_query: str) -> str:
+    client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    resp = client.messages.create(
+        model=CLAUDE_SQL_MODEL,
+        max_tokens=512,
+        system=_NL_SCHEMA,
+        messages=[{"role": "user", "content": nl_query}],
+    )
+    return _clean_sql(resp.content[0].text)
+
+
+def _generate_sql_ollama(nl_query: str) -> str:
     client = _ollama.Client(host=OLLAMA_HOST, timeout=20.0)
     resp = client.chat(
         model=SQL_MODEL,
@@ -60,11 +87,14 @@ def _generate_sql(nl_query: str) -> str:
             {"role": "user", "content": nl_query},
         ],
     )
-    sql = resp.message.content.strip()
+    return _clean_sql(resp.message.content)
+
+
+def _clean_sql(sql: str) -> str:
+    sql = sql.strip()
     if "```" in sql:
         parts = sql.split("```")
         sql = parts[1].lstrip("sql\n").strip() if len(parts) > 1 else sql
-    # strip any leading explanation before SELECT
     lower = sql.lower()
     for keyword in ("select", "with"):
         idx = lower.find(keyword)
@@ -72,6 +102,11 @@ def _generate_sql(nl_query: str) -> str:
             sql = sql[idx:]
             break
     return sql.strip()
+
+
+@st.cache_resource
+def get_conn():
+    return duckdb.connect(DB_PATH, read_only=True)
 
 
 st.set_page_config(page_title="Content Catalogue", layout="wide")
@@ -100,18 +135,19 @@ except Exception:
     pass
 
 
-@st.cache_resource
-def get_conn():
-    return duckdb.connect(DB_PATH, read_only=True)
-
-
 with open(QUERIES_PATH) as f:
     saved = yaml.safe_load(f)
 
 # --- Natural language search ---
-if HAS_OLLAMA:
+if HAS_NL:
+    _backend_label = (
+        f"Claude · model: `{CLAUDE_SQL_MODEL}`"
+        if HAS_CLAUDE
+        else f"Ollama · model: `{SQL_MODEL}` · host: `{OLLAMA_HOST}`"
+    )
+    _spinner_label = CLAUDE_SQL_MODEL if HAS_CLAUDE else SQL_MODEL
     with st.expander("Natural Language Search", expanded=True):
-        st.caption(f"Powered by Ollama · model: `{SQL_MODEL}` · host: `{OLLAMA_HOST}`")
+        st.caption(f"Powered by {_backend_label}")
         nl_col, btn_col = st.columns([5, 1])
         nl_query = nl_col.text_input(
             "nl",
@@ -120,7 +156,7 @@ if HAS_OLLAMA:
             key="nl_input",
         )
         if btn_col.button("Generate SQL", use_container_width=True) and nl_query.strip():
-            with st.spinner(f"Asking {SQL_MODEL}..."):
+            with st.spinner(f"Asking {_spinner_label}..."):
                 try:
                     generated = _generate_sql(nl_query.strip())
                     st.session_state["sql_area"] = generated

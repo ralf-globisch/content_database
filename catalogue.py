@@ -493,6 +493,9 @@ OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "moondream")
 OLLAMA_SQL_MODEL    = os.environ.get("OLLAMA_SQL_MODEL",    "llama3.2")
 DOCKER_IMAGE        = os.environ.get("DOCKER_IMAGE",        "content-catalogue")
 
+ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY")
+CLAUDE_VISION_MODEL = os.environ.get("CLAUDE_VISION_MODEL", "claude-haiku-4-5-20251001")
+
 HASH_MATCH_THRESHOLD = 10  # max dHash bit distance (out of 64) to consider files same-source
 
 _VISION_PROMPT = """\
@@ -505,6 +508,21 @@ _STRUCTURE_PROMPT = """\
 Given this description of video frames, respond with ONLY a JSON object — no markdown.
 
 Description: {description}
+Filename: {filename}
+
+{{
+  "description": "2-3 sentence summary",
+  "style": "live_action or animated or cgi or mixed",
+  "has_credits": true or false,
+  "brightness": "bright or normal or dark or mixed",
+  "genre_tags": ["tag1", "tag2"]
+}}
+
+For genre_tags pick 1-5 from: action, drama, comedy, documentary, sports, news, \
+animation, nature, music, commercial, trailer, educational, gaming, film."""
+
+_CLAUDE_PROMPT = """\
+Analyse these video frames and respond with ONLY a JSON object — no markdown fences.
 Filename: {filename}
 
 {{
@@ -566,7 +584,32 @@ def extract_frame_base64(url: str, offset_s: float) -> str | None:
 
 
 def analyze_frames(frames_b64: list[str], filename: str) -> dict:
-    """Classify video frames: vision model describes, SQL model structures."""
+    """Classify video frames. Uses Claude when ANTHROPIC_API_KEY is set, else Ollama."""
+    if ANTHROPIC_API_KEY:
+        return _analyze_frames_claude(frames_b64, filename)
+    return _analyze_frames_ollama(frames_b64, filename)
+
+
+def _analyze_frames_claude(frames_b64: list[str], filename: str) -> dict:
+    try:
+        import anthropic
+    except ImportError:
+        raise RuntimeError("pip install anthropic")
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": f}}
+        for f in frames_b64
+    ]
+    content.append({"type": "text", "text": _CLAUDE_PROMPT.format(filename=filename)})
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    resp = client.messages.create(
+        model=CLAUDE_VISION_MODEL,
+        max_tokens=512,
+        messages=[{"role": "user", "content": content}],
+    )
+    return _extract_json(resp.content[0].text)
+
+
+def _analyze_frames_ollama(frames_b64: list[str], filename: str) -> dict:
     try:
         import ollama
     except ImportError:

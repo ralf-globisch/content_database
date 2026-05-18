@@ -22,6 +22,14 @@ OLLAMA_FLAGS := -e OLLAMA_HOST=$(OLLAMA_HOST) \
 	-e OLLAMA_VISION_MODEL=$(OLLAMA_VISION_MODEL) \
 	-e OLLAMA_SQL_MODEL=$(OLLAMA_SQL_MODEL)
 
+# Claude — used when ANTHROPIC_API_KEY is set; takes precedence over Ollama
+CLAUDE_VISION_MODEL ?= claude-haiku-4-5-20251001
+CLAUDE_SQL_MODEL    ?= claude-haiku-4-5-20251001
+# ANTHROPIC_API_KEY is inherited from the shell environment — set it with:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+CLAUDE_FLAGS := -e CLAUDE_SQL_MODEL=$(CLAUDE_SQL_MODEL) \
+	$(if $(ANTHROPIC_API_KEY),-e ANTHROPIC_API_KEY=$(ANTHROPIC_API_KEY),)
+
 # Python interpreter for the vision phase (runs on host, not in Docker)
 PYTHON ?= python3
 
@@ -62,6 +70,8 @@ vision: check-auth $(DB_DIR)
 	OLLAMA_HOST=$(OLLAMA_HOST) \
 	OLLAMA_VISION_MODEL=$(OLLAMA_VISION_MODEL) \
 	OLLAMA_SQL_MODEL=$(OLLAMA_SQL_MODEL) \
+	CLAUDE_VISION_MODEL=$(CLAUDE_VISION_MODEL) \
+	$(if $(ANTHROPIC_API_KEY),ANTHROPIC_API_KEY=$(ANTHROPIC_API_KEY),) \
 	DOCKER_IMAGE=$(IMAGE) \
 	$(or $(AWS_PROFILE:%=AWS_PROFILE=%),) \
 	$(PYTHON) catalogue.py --phase vision --bucket $(BUCKET) --db $(CURDIR)/data/content_catalogue.duckdb $(PROFILE_ARG) $(ARGS)
@@ -94,6 +104,7 @@ shell: $(DB_DIR)
 ui: $(DB_DIR)
 	docker run --rm -it -p 8501:8501 \
 		$(OLLAMA_FLAGS) \
+		$(CLAUDE_FLAGS) \
 		-v "$(DB_DIR):/data" \
 		--entrypoint streamlit $(IMAGE) \
 		run /app/app.py \
@@ -120,12 +131,14 @@ help:
 	@echo "  export AWS_PROFILE=my-profile"
 	@echo "  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=..."
 	@echo ""
-	@echo "Ollama (required for 'vision' and NL search in UI):"
-	@echo "  ollama pull moondream  # vision model, CPU-friendly (~800 MB)"
-	@echo "  ollama pull llama3.2   # SQL/structure model (~2 GB)"
-	@echo "  Override host:   OLLAMA_HOST=http://other-host:11434 make vision"
-	@echo "  Override models: OLLAMA_VISION_MODEL=llava make vision  (GPU hosts)"
-	@echo "  Override python: PYTHON=/path/to/venv/bin/python make vision"
+	@echo "AI backend (pick one or both — Claude takes precedence when key is set):"
+	@echo "  export ANTHROPIC_API_KEY=sk-ant-...   # enables Claude backend"
+	@echo "  ollama pull moondream                  # Ollama vision model (~800 MB)"
+	@echo "  ollama pull llama3.2                   # Ollama SQL/structure model (~2 GB)"
+	@echo "  Override Ollama host:  OLLAMA_HOST=http://other-host:11434 make vision"
+	@echo "  Override Ollama model: OLLAMA_VISION_MODEL=llava make vision  (GPU hosts)"
+	@echo "  Override Claude model: CLAUDE_VISION_MODEL=claude-sonnet-4-6 make vision"
+	@echo "  Override python:       PYTHON=/path/to/venv/bin/python make vision"
 	@echo ""
 	@echo "Optional ARGS examples:"
 	@echo "  ARGS=\"--prefix analysis/jan-ozer-per-title-files/\"   scope to a prefix"
