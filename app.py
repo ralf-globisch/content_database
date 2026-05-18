@@ -40,11 +40,9 @@ Database tables:
     analyzed_at TEXT,
     source_key TEXT)  -- non-NULL means this row is a copy; source_key points to the analysed representative
 
-Canonical aliases (use these, do not reassign them):
-  mf = media_files
-  mm = media_metadata
-  atr = audio_tracks
-  cv = content_vision
+When aliasing, always write the full table name followed by the alias, e.g.:
+  media_files mf, media_metadata mm, audio_tracks atr, content_vision cv
+Never use an alias alone in the FROM clause — always write the full table name first.
 
 Rules:
 - Return ONLY the SQL statement, no explanation, no markdown fences.
