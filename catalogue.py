@@ -556,7 +556,14 @@ def extract_frame_base64(url: str, offset_s: float) -> str | None:
             log.warning("ffmpeg failed (rc=%d): %s", r.returncode, r.stderr.decode(errors="replace")[-500:])
             return None
         return base64.b64encode(r.stdout).decode()
-    except Exception:
+    except FileNotFoundError:
+        raise RuntimeError(
+            "docker not found — ensure Docker is running and 'docker' is on PATH"
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("ffmpeg timed out after 60s extracting frame")
+    except Exception as exc:
+        log.warning("Frame extraction error (%s): %s", type(exc).__name__, exc)
         return None
 
 
