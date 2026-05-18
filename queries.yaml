@@ -276,3 +276,89 @@ vision_all:
     FROM content_vision v
     JOIN media_files f USING (s3_key)
     ORDER BY v.analyzed_at DESC
+
+vision_by_genre:
+  label: "Vision — files by genre tag"
+  sql: |
+    SELECT
+      genre,
+      count(*)  AS files
+    FROM (
+      SELECT UNNEST(genre_tags) AS genre
+      FROM content_vision
+      WHERE genre_tags IS NOT NULL
+    )
+    GROUP BY genre
+    ORDER BY files DESC
+
+vision_genre_detail:
+  label: "Vision — genre tag detail"
+  sql: |
+    SELECT
+      v.s3_key,
+      UNNEST(v.genre_tags)          AS genre,
+      v.style,
+      v.brightness,
+      round(f.size_bytes / 1e6, 1)  AS size_mb
+    FROM content_vision v
+    JOIN media_files f USING (s3_key)
+    WHERE v.genre_tags IS NOT NULL
+    ORDER BY genre, f.size_bytes DESC
+
+unanalyzed_files:
+  label: "Vision — files not yet analyzed"
+  sql: |
+    SELECT
+      f.s3_key,
+      f.extension,
+      round(f.size_bytes / 1e6, 1)             AS size_mb,
+      m.video_codec,
+      m.width::TEXT || 'x' || m.height::TEXT   AS resolution,
+      round(m.duration_s, 1)                   AS duration_s
+    FROM media_files f
+    LEFT JOIN media_metadata m USING (s3_key)
+    LEFT JOIN content_vision v USING (s3_key)
+    WHERE f.media_type = 'video'
+      AND v.s3_key IS NULL
+    ORDER BY f.size_bytes DESC
+
+duration_buckets:
+  label: "Video — duration distribution"
+  sql: |
+    SELECT
+      CASE
+        WHEN duration_s <    60 THEN '< 1 min'
+        WHEN duration_s <   300 THEN '1–5 min'
+        WHEN duration_s <  1800 THEN '5–30 min'
+        WHEN duration_s <  3600 THEN '30–60 min'
+        ELSE                         '> 1 hour'
+      END                            AS bucket,
+      count(*)                       AS files,
+      round(sum(m.duration_s) / 3600, 1) AS total_hours
+    FROM media_metadata m
+    JOIN media_files f USING (s3_key)
+    WHERE f.media_type = 'video'
+      AND m.duration_s IS NOT NULL
+    GROUP BY 1
+    ORDER BY min(duration_s)
+
+metadata_gaps:
+  label: "Metadata — missing or errored probes"
+  sql: |
+    SELECT
+      f.s3_key,
+      round(f.size_bytes / 1e6, 1)  AS size_mb,
+      f.extension,
+      CASE
+        WHEN m.s3_key IS NULL   THEN 'not probed'
+        WHEN m.error IS NOT NULL THEN 'probe error'
+        WHEN m.duration_s IS NULL AND f.media_type = 'video' THEN 'missing duration'
+        ELSE 'incomplete'
+      END  AS issue,
+      m.error
+    FROM media_files f
+    LEFT JOIN media_metadata m USING (s3_key)
+    WHERE m.s3_key IS NULL
+       OR m.error IS NOT NULL
+       OR (m.duration_s IS NULL AND f.media_type = 'video')
+    ORDER BY f.size_bytes DESC
