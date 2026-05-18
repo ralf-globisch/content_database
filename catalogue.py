@@ -790,13 +790,16 @@ def run_vision_phase(
     """).fetchall()
 
     done = already_vision_analyzed(con)
+    pending_rows = [row for row in rows if row[0] not in done]
+
     if no_dedup:
-        all_groups = [(key, dur, []) for key, dur, w, h, sz in rows]
+        all_groups = [(key, dur, []) for key, dur, w, h, sz in pending_rows]
     else:
-        all_groups = _group_by_content(rows, s3_client=s3, bucket=bucket)
-    todo_groups = [(rep, dur, variants) for rep, dur, variants in all_groups if rep not in done]
-    if limit:
-        todo_groups = todo_groups[:limit]
+        if pending_rows:
+            log.info("Grouping %d pending video files for deduplication ...", len(pending_rows))
+        all_groups = _group_by_content(pending_rows, s3_client=s3, bucket=bucket)
+
+    todo_groups = all_groups[:limit] if limit else all_groups
 
     total_files = sum(1 + len(v) for rep, dur, v in todo_groups)
     log.info(
