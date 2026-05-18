@@ -401,10 +401,6 @@ def probe_one(s3_client, bucket: str, key: str) -> tuple[str, dict]:
     return key, meta
 
 
-def already_probed(con: duckdb.DuckDBPyConnection) -> set[str]:
-    return {r[0] for r in con.execute("SELECT s3_key FROM media_metadata").fetchall()}
-
-
 def run_metadata_phase(
     con: duckdb.DuckDBPyConnection,
     bucket: str,
@@ -414,9 +410,10 @@ def run_metadata_phase(
 ) -> None:
     s3 = _s3_client(profile)
 
-    done = already_probed(con)
-    keys = [r[0] for r in con.execute("SELECT s3_key FROM media_files").fetchall()
-            if r[0] not in done]
+    keys = [r[0] for r in con.execute("""
+        SELECT s3_key FROM media_files
+        WHERE s3_key NOT IN (SELECT s3_key FROM media_metadata)
+    """).fetchall()]
     if limit:
         keys = keys[:limit]
 
@@ -668,11 +665,14 @@ def _confirm_with_hash(
 
     if len(hashes) >= 2:
         keys = list(hashes)
-        max_dist = max(
-            hashes[a] - hashes[b]
-            for i, a in enumerate(keys)
-            for b in keys[i + 1:]
-        )
+        max_dist = 0
+        for i, a in enumerate(keys):
+            for b in keys[i + 1:]:
+                max_dist = max(max_dist, hashes[a] - hashes[b])
+                if max_dist > HASH_MATCH_THRESHOLD:
+                    break
+            if max_dist > HASH_MATCH_THRESHOLD:
+                break
         if max_dist <= HASH_MATCH_THRESHOLD:
             log.info("Cross-dir hash match (dist=%d): %d files → 1 group", max_dist, len(items))
             return [items]
