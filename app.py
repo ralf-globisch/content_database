@@ -164,3 +164,4 @@ if "df" in st.session_state:
 
     start = (page - 1) * PAGE_SIZE
     st.dataframe(df.iloc[start : start + PAGE_SIZE], use_container_width=True)
+    st.download_button("Download CSV", df.to_csv(index=False), "results.csv", "text/csv")
