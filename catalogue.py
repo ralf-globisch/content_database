@@ -320,7 +320,8 @@ def parse_ffprobe(data: dict, mediainfo_tracks: dict | None = None) -> dict:
     r_frame_rate = video.get("r_frame_rate", "")
     if "/" in r_frame_rate:
         num, den = r_frame_rate.split("/")
-        fps = round(int(num) / int(den), 3) if int(den) else None
+        val = round(int(num) / int(den), 3) if int(den) else None
+        fps = val if val and val >= 1 else None
 
     # bitrate
     bitrate = fmt.get("bit_rate") or video.get("bit_rate")
