@@ -42,7 +42,7 @@ Database tables:
 
 Rules:
 - Return ONLY the SQL statement, no explanation, no markdown fences.
-- Use DuckDB syntax (list_contains for array search, :: for casting).
+- Use DuckDB syntax. For array columns use list_contains(genre_tags, 'sports').
 - JOIN tables via s3_key when needed.
 - NEVER use 'at' as a table alias — it is a reserved keyword in DuckDB. Use 'atr' for audio_tracks."""
 
