@@ -14,13 +14,19 @@ else
 PROFILE_ARG :=
 endif
 
+# Ollama — runs on the host; host.docker.internal resolves via --add-host on Linux
+OLLAMA_HOST     ?= http://host.docker.internal:11434
+OLLAMA_FLAGS    := --add-host=host.docker.internal:host-gateway \
+	-e OLLAMA_HOST=$(OLLAMA_HOST) \
+	-e OLLAMA_VISION_MODEL=$(or $(OLLAMA_VISION_MODEL),llava) \
+	-e OLLAMA_SQL_MODEL=$(or $(OLLAMA_SQL_MODEL),llama3.2)
 
 DOCKER_RUN := docker run --rm \
 	$(AWS_FLAGS) \
 	-v "$(DB_DIR):/data" \
 	$(IMAGE)
 
-.PHONY: build inventory metadata both summary query shell ui help check-auth
+.PHONY: build inventory metadata vision both summary query shell ui help check-auth
 
 check-auth:
 	@test -d $(HOME)/.aws || { echo "No ~/.aws directory found. Run: aws configure"; exit 1; }
@@ -36,6 +42,15 @@ inventory: check-auth $(DB_DIR)
 ## Phase 2 — extract metadata via ffprobe (resumes from where it left off)
 metadata: check-auth $(DB_DIR)
 	$(DOCKER_RUN) --phase metadata --bucket $(BUCKET) --db $(DB_FILE) $(PROFILE_ARG) $(ARGS)
+
+## Phase 3 — analyse video frames with Ollama llava (resumes from where it left off)
+## Requires Ollama running on host with: ollama pull llava
+vision: check-auth $(DB_DIR)
+	docker run --rm \
+		$(AWS_FLAGS) $(OLLAMA_FLAGS) \
+		-v "$(DB_DIR):/data" \
+		$(IMAGE) \
+		--phase vision --bucket $(BUCKET) --db $(DB_FILE) $(PROFILE_ARG) $(ARGS)
 
 ## Run both phases in sequence
 both: check-auth $(DB_DIR)
@@ -61,8 +76,11 @@ shell: $(DB_DIR)
 		--entrypoint python $(IMAGE) -m duckdb $(DB_FILE)
 
 ## Open the Streamlit query UI (http://localhost:8501)
+## Natural language search requires Ollama running on host with: ollama pull llama3.2
 ui: $(DB_DIR)
-	docker run --rm -it -p 8501:8501 -v "$(DB_DIR):/data" \
+	docker run --rm -it -p 8501:8501 \
+		$(OLLAMA_FLAGS) \
+		-v "$(DB_DIR):/data" \
 		--entrypoint streamlit $(IMAGE) \
 		run /app/app.py \
 		--server.address=0.0.0.0 \
@@ -77,6 +95,7 @@ help:
 	@echo "  make build                          Build the Docker image"
 	@echo "  make inventory  [ARGS=...]           Phase 1: list all media files"
 	@echo "  make metadata   [ARGS=...]           Phase 2: extract attributes via ffprobe"
+	@echo "  make vision     [ARGS=...]           Phase 3: analyse frames with Ollama llava"
 	@echo "  make both       [ARGS=...]           Run Phase 1 + 2"
 	@echo "  make summary                        Print collected stats"
 	@echo "  make query Q=\"<sql>\"                 Run a SQL query on the DB"
@@ -86,6 +105,12 @@ help:
 	@echo "AWS credentials (pick one):"
 	@echo "  export AWS_PROFILE=my-profile"
 	@echo "  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=..."
+	@echo ""
+	@echo "Ollama (required for 'vision' and NL search in UI):"
+	@echo "  ollama pull llava      # vision model (~4 GB)"
+	@echo "  ollama pull llama3.2   # SQL generation model (~2 GB)"
+	@echo "  Override host: OLLAMA_HOST=http://other-host:11434 make vision"
+	@echo "  Swap models:   OLLAMA_VISION_MODEL=llava-llama3 make vision"
 	@echo ""
 	@echo "Optional ARGS examples:"
 	@echo "  ARGS=\"--prefix analysis/jan-ozer-per-title-files/\"   scope to a prefix"
