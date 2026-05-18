@@ -772,6 +772,7 @@ def run_vision_phase(
     limit: int | None,
     no_dedup: bool = False,
     retry_errors: bool = False,
+    hash_dedup: bool = False,
 ) -> None:
     s3 = _s3_client(profile)
 
@@ -797,7 +798,9 @@ def run_vision_phase(
     else:
         if pending_rows:
             log.info("Grouping %d pending video files for deduplication ...", len(pending_rows))
-        all_groups = _group_by_content(pending_rows, s3_client=s3, bucket=bucket)
+        s3_arg = s3 if hash_dedup else None
+        bucket_arg = bucket if hash_dedup else None
+        all_groups = _group_by_content(pending_rows, s3_client=s3_arg, bucket=bucket_arg)
 
     todo_groups = all_groups[:limit] if limit else all_groups
 
@@ -977,6 +980,9 @@ def main() -> None:
                         help="Skip variant grouping and classify every video file individually")
     parser.add_argument("--retry-errors", action="store_true",
                         help="Clear error sentinel rows before running vision so failed files are re-analysed")
+    parser.add_argument("--hash-dedup", action="store_true",
+                        help="Use perceptual hash (dHash) to confirm cross-directory variant grouping "
+                             "(slower — runs docker ffmpeg per file; omit for large catalogues)")
     parser.add_argument("--vision-workers", type=int, default=1,
                         help="Parallel workers for vision phase (default 1; increase on GPU hosts)")
     args = parser.parse_args()
@@ -995,7 +1001,8 @@ def main() -> None:
 
     if args.phase == "vision":
         run_vision_phase(con, args.bucket, args.profile, args.vision_workers, args.limit,
-                         no_dedup=args.no_dedup, retry_errors=args.retry_errors)
+                         no_dedup=args.no_dedup, retry_errors=args.retry_errors,
+                         hash_dedup=args.hash_dedup)
 
     if args.phase in ("summary", "both"):
         print_summary(con)
