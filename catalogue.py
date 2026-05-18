@@ -110,9 +110,15 @@ def init_db(db_path: str) -> duckdb.DuckDBPyConnection:
             has_credits BOOLEAN,
             brightness  TEXT,
             genre_tags  VARCHAR[],
-            analyzed_at TEXT
+            analyzed_at TEXT,
+            source_key  TEXT  -- NULL = directly analysed; set = copied from this key
         )
     """)
+    # migrate existing databases that predate source_key
+    try:
+        con.execute("ALTER TABLE content_vision ADD COLUMN source_key TEXT")
+    except Exception:
+        pass
     return con
 
 
@@ -178,6 +184,13 @@ def save_inventory(con: duckdb.DuckDBPyConnection, media: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 # Phase 2 — metadata via ffprobe (+ optional mediainfo)
 # ---------------------------------------------------------------------------
+
+def _s3_client(profile: str | None):
+    """S3 client with SigV4 forced — required for presigned URLs with STS credentials."""
+    from botocore.config import Config
+    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    return session.client("s3", config=Config(signature_version="s3v4"))
+
 
 def presign(s3_client, bucket: str, key: str) -> str:
     return s3_client.generate_presigned_url(
@@ -381,8 +394,7 @@ def run_metadata_phase(
     workers: int,
     limit: int | None,
 ) -> None:
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
-    s3 = session.client("s3")
+    s3 = _s3_client(profile)
 
     done = already_probed(con)
     keys = [r[0] for r in con.execute("SELECT s3_key FROM media_files").fetchall()
@@ -465,20 +477,29 @@ OLLAMA_HOST         = os.environ.get("OLLAMA_HOST",         "http://localhost:11
 OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "llava")
 OLLAMA_SQL_MODEL    = os.environ.get("OLLAMA_SQL_MODEL",    "llama3.2")
 
+HASH_MATCH_THRESHOLD = 10  # max dHash bit distance (out of 64) to consider files same-source
+
 _VISION_PROMPT = """\
-Look at these video frames and respond with ONLY a JSON object — no markdown, no explanation.
+Analyse these video frames and output ONLY a JSON object with exactly these fields \
+(no markdown, no explanation, start with {):
 
 {
-  "description": "2-3 sentence description of what this content appears to be",
-  "style": "live_action or animated or cgi or mixed",
-  "has_credits": true or false,
-  "brightness": "bright or normal or dark or mixed",
-  "genre_tags": ["tag1", "tag2"]
+  "description": "2-3 sentences describing the video content",
+  "style": "live_action",
+  "has_credits": false,
+  "brightness": "normal",
+  "genre_tags": ["drama"]
 }
 
-genre_tags: pick 1-5 from: action, drama, comedy, documentary, sports, news, animation, \
-nature, music, commercial, trailer, educational, gaming, film.
-The last frame may show ending credits — look for dense text overlays."""
+Field rules:
+- style: one of live_action, animated, cgi, mixed
+- has_credits: true if any frame shows title cards or scrolling credits text
+- brightness: one of bright, normal, dark, mixed
+- genre_tags: 1-5 tags from: action, drama, comedy, documentary, sports, news, \
+animation, nature, music, commercial, trailer, educational, gaming, film"""
+
+_VISION_RETRY = "Your previous response was not valid JSON. \
+Output ONLY the JSON object. Start with { and end with }. No other text."
 
 
 def _extract_json(text: str) -> dict:
@@ -525,15 +546,37 @@ def analyze_frames(frames_b64: list[str], filename: str) -> dict:
         raise RuntimeError("pip install ollama")
 
     client = ollama.Client(host=OLLAMA_HOST)
-    resp = client.chat(
+    first_msg = {
+        "role": "user",
+        "content": f"File: {filename}\n\n{_VISION_PROMPT}",
+        "images": frames_b64,
+    }
+
+    # Attempt 1: ask Ollama to enforce JSON at the server level
+    try:
+        resp = client.chat(model=OLLAMA_VISION_MODEL, messages=[first_msg], format="json")
+        return _extract_json(resp.message.content)
+    except Exception:
+        pass
+
+    # Attempt 2: plain chat without format enforcement
+    resp = client.chat(model=OLLAMA_VISION_MODEL, messages=[first_msg])
+    try:
+        return _extract_json(resp.message.content)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Attempt 3: follow-up nudge asking the model to fix its output
+    resp2 = client.chat(
         model=OLLAMA_VISION_MODEL,
-        messages=[{
-            "role": "user",
-            "content": f"File: {filename}\n\n{_VISION_PROMPT}",
-            "images": frames_b64,
-        }],
+        messages=[
+            first_msg,
+            {"role": "assistant", "content": resp.message.content},
+            {"role": "user", "content": _VISION_RETRY},
+        ],
+        format="json",
     )
-    return _extract_json(resp.message.content)
+    return _extract_json(resp2.message.content)
 
 
 def already_vision_analyzed(con: duckdb.DuckDBPyConnection) -> set[str]:
@@ -559,6 +602,118 @@ def vision_one(
         return key, {"_error": str(exc)[:500]}
 
 
+def _compute_dhash(frame_b64: str):
+    """Return a perceptual dHash for a base64-encoded JPEG frame, or None on error."""
+    try:
+        import imagehash
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(base64.b64decode(frame_b64)))
+        return imagehash.dhash(img)
+    except Exception:
+        return None
+
+
+def _confirm_with_hash(
+    items: list[tuple],
+    s3_client,
+    bucket: str,
+    dur_s: float,
+) -> list[list[tuple]]:
+    """Extract one mid-point frame per item, compute dHash, and decide grouping.
+
+    Returns a list of sub-groups:
+    - Single list with all items if max pairwise dHash distance ≤ HASH_MATCH_THRESHOLD.
+    - Multiple lists split by parent directory otherwise.
+    """
+    from collections import defaultdict
+
+    frames: dict[str, str] = {}
+    for key, dur, w, h, sz in items:
+        url = presign(s3_client, bucket, key)
+        offset = (dur if dur else dur_s) * 0.5
+        frame = extract_frame_base64(url, offset)
+        if frame:
+            frames[key] = frame
+
+    hashes: dict[str, object] = {}
+    for k, f in frames.items():
+        h = _compute_dhash(f)
+        if h is not None:
+            hashes[k] = h
+
+    if len(hashes) >= 2:
+        keys = list(hashes)
+        max_dist = max(
+            hashes[a] - hashes[b]
+            for i, a in enumerate(keys)
+            for b in keys[i + 1:]
+        )
+        if max_dist <= HASH_MATCH_THRESHOLD:
+            log.info("Cross-dir hash match (dist=%d): %d files → 1 group", max_dist, len(items))
+            return [items]
+        log.info("Cross-dir hash mismatch (dist=%d): keeping separate", max_dist)
+
+    by_dir: dict[str, list] = defaultdict(list)
+    for item in items:
+        parent = item[0].rsplit("/", 1)[0] if "/" in item[0] else ""
+        by_dir[parent].append(item)
+    return list(by_dir.values())
+
+
+def _group_by_content(
+    rows: list[tuple],
+    s3_client=None,
+    bucket: str | None = None,
+) -> list[tuple[str, float | None, list[str]]]:
+    """Group video files by content to detect encoding variants.
+
+    Tier 1 (same directory, same duration): no hash check needed.
+    Tier 2 (different directories, same content scope + duration): confirmed by dHash.
+
+    content_scope = first 2 path segments (e.g. "analysis/content_database").
+
+    Returns list of (representative_key, duration_s, [variant_keys]).
+    The representative is the highest-resolution file in the group (falls back to
+    largest file size). Files without duration metadata are kept as solo groups.
+    """
+    from collections import defaultdict
+
+    def _content_scope(key: str) -> str:
+        parts = key.split("/")
+        return "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
+
+    scope_buckets: dict[tuple, list] = defaultdict(list)
+    for key, dur, w, h, sz in rows:
+        dur_key = round(dur) if dur is not None else None
+        scope_buckets[(_content_scope(key), dur_key)].append((key, dur, w, h, sz))
+
+    groups = []
+    for (scope, dur_key), items in scope_buckets.items():
+        dirs = {item[0].rsplit("/", 1)[0] if "/" in item[0] else "" for item in items}
+
+        if len(dirs) <= 1:
+            # Tier 1: all files in same directory — high confidence, no hash needed
+            items.sort(key=lambda x: ((x[2] or 0) * (x[3] or 0), x[4] or 0), reverse=True)
+            groups.append((items[0][0], items[0][1], [x[0] for x in items[1:]]))
+        else:
+            # Tier 2: files across multiple directories — confirm with perceptual hash
+            if s3_client and bucket and dur_key is not None:
+                sub_groups = _confirm_with_hash(items, s3_client, bucket, dur_key)
+            else:
+                sub_groups_dict: dict[str, list] = defaultdict(list)
+                for item in items:
+                    parent = item[0].rsplit("/", 1)[0] if "/" in item[0] else ""
+                    sub_groups_dict[parent].append(item)
+                sub_groups = list(sub_groups_dict.values())
+
+            for sg in sub_groups:
+                sg.sort(key=lambda x: ((x[2] or 0) * (x[3] or 0), x[4] or 0), reverse=True)
+                groups.append((sg[0][0], sg[0][1], [x[0] for x in sg[1:]]))
+
+    return groups
+
+
 def run_vision_phase(
     con: duckdb.DuckDBPyConnection,
     bucket: str,
@@ -566,22 +721,26 @@ def run_vision_phase(
     workers: int,
     limit: int | None,
 ) -> None:
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
-    s3 = session.client("s3")
+    s3 = _s3_client(profile)
 
-    done = already_vision_analyzed(con)
     rows = con.execute("""
-        SELECT f.s3_key, m.duration_s
+        SELECT f.s3_key, m.duration_s, m.width, m.height, f.size_bytes
         FROM media_files f
         LEFT JOIN media_metadata m USING (s3_key)
         WHERE f.media_type = 'video'
     """).fetchall()
 
-    todo = [(key, dur) for key, dur in rows if key not in done]
+    done = already_vision_analyzed(con)
+    all_groups = _group_by_content(rows, s3_client=s3, bucket=bucket)
+    todo_groups = [(rep, dur, variants) for rep, dur, variants in all_groups if rep not in done]
     if limit:
-        todo = todo[:limit]
+        todo_groups = todo_groups[:limit]
 
-    log.info("Vision analysis: %d video files, %d workers", len(todo), workers)
+    total_files = sum(1 + len(v) for rep, dur, v in todo_groups)
+    log.info(
+        "Vision analysis: %d groups (%d files total), %d workers",
+        len(todo_groups), total_files, workers,
+    )
 
     batch: list[tuple] = []
 
@@ -590,37 +749,49 @@ def run_vision_phase(
             con.executemany(
                 """
                 INSERT OR REPLACE INTO content_vision
-                    (s3_key, description, style, has_credits, brightness, genre_tags, analyzed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (s3_key, description, style, has_credits, brightness,
+                     genre_tags, analyzed_at, source_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 batch,
             )
             batch.clear()
 
     now = datetime.now(timezone.utc).isoformat()
+    # map future → variant keys so we can copy results on completion
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(vision_one, s3, bucket, key, dur): key for key, dur in todo}
+        futures = {
+            pool.submit(vision_one, s3, bucket, rep, dur): (rep, variants)
+            for rep, dur, variants in todo_groups
+        }
         for i, future in enumerate(as_completed(futures), 1):
+            rep_key, variants = futures[future]
             key, result = future.result()
             if "_error" in result:
-                log.warning("[%d/%d] ERR %s: %s", i, len(todo), key, result["_error"])
+                log.warning("[%d/%d] ERR %s: %s", i, len(todo_groups), key, result["_error"])
                 continue
-            batch.append((
-                key,
+
+            row = (
                 result.get("description"),
                 result.get("style"),
                 result.get("has_credits"),
                 result.get("brightness"),
                 result.get("genre_tags") or [],
                 now,
-            ))
+            )
+            batch.append((key, *row, None))           # source_key=None (directly analysed)
+            for vkey in variants:
+                batch.append((vkey, *row, key))        # source_key=representative
+
+            variant_note = f"  (+{len(variants)} variants)" if variants else ""
             log.info(
-                "[%d/%d] OK  style=%-11s credits=%-5s brightness=%-6s  %s",
-                i, len(todo),
+                "[%d/%d] OK  style=%-11s credits=%-5s brightness=%-6s  %s%s",
+                i, len(todo_groups),
                 result.get("style", "?"),
                 result.get("has_credits"),
                 result.get("brightness", "?"),
                 key.rsplit("/", 1)[-1],
+                variant_note,
             )
             if len(batch) >= 10:
                 flush()
