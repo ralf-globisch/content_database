@@ -132,10 +132,11 @@ sql = st.text_area("SQL", height=140, key="sql_area")
 if st.button("Run", type="primary"):
     st.session_state["page"] = 1
     try:
+        get_conn().execute(f"EXPLAIN {sql}")
         st.session_state["df"] = get_conn().execute(sql).df()
     except Exception as e:
         st.session_state.pop("df", None)
-        st.error(str(e))
+        st.error(f"Query error: {e}")
 
 if "df" in st.session_state:
     df = st.session_state["df"]
