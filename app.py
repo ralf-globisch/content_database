@@ -40,11 +40,17 @@ Database tables:
     analyzed_at TEXT,
     source_key TEXT)  -- non-NULL means this row is a copy; source_key points to the analysed representative
 
+Canonical aliases (use these, do not reassign them):
+  mf = media_files
+  mm = media_metadata
+  atr = audio_tracks
+  cv = content_vision
+
 Rules:
 - Return ONLY the SQL statement, no explanation, no markdown fences.
 - Use DuckDB syntax. For array columns use list_contains(genre_tags, 'sports').
 - JOIN tables via s3_key when needed.
-- NEVER use 'at' as a table alias — it is a reserved keyword in DuckDB. Use 'atr' for audio_tracks."""
+- NEVER use 'at' as a table alias — it is a reserved keyword in DuckDB."""
 
 
 def _generate_sql(nl_query: str) -> str:
