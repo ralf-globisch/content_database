@@ -974,6 +974,8 @@ def main() -> None:
                         help="Skip variant grouping and classify every video file individually")
     parser.add_argument("--retry-errors", action="store_true",
                         help="Clear error sentinel rows before running vision so failed files are re-analysed")
+    parser.add_argument("--vision-workers", type=int, default=1,
+                        help="Parallel workers for vision phase (default 1; increase on GPU hosts)")
     args = parser.parse_args()
 
     con = init_db(args.db)
@@ -989,8 +991,7 @@ def main() -> None:
         run_metadata_phase(con, args.bucket, args.profile, args.workers, args.limit)
 
     if args.phase == "vision":
-        vision_workers = min(args.workers, 1)  # vision models crash under parallel load on CPU-only hosts
-        run_vision_phase(con, args.bucket, args.profile, vision_workers, args.limit,
+        run_vision_phase(con, args.bucket, args.profile, args.vision_workers, args.limit,
                          no_dedup=args.no_dedup, retry_errors=args.retry_errors)
 
     if args.phase in ("summary", "both"):

@@ -55,8 +55,9 @@ metadata: check-auth $(DB_DIR)
 
 ## Phase 3 — analyse video frames with Ollama (runs on host, not Docker)
 ## Requires: pip install ollama boto3 duckdb  +  ollama pull moondream llama3.2
-## Override models: OLLAMA_VISION_MODEL=llava make vision  (e.g. on GPU hosts)
-## Override python: PYTHON=/path/to/venv/bin/python make vision
+## Override models:  OLLAMA_VISION_MODEL=llava make vision  (e.g. on GPU hosts)
+## Override workers: ARGS="--vision-workers 4" make vision  (GPU hosts only)
+## Override python:  PYTHON=/path/to/venv/bin/python make vision
 vision: check-auth $(DB_DIR)
 	OLLAMA_HOST=$(OLLAMA_HOST) \
 	OLLAMA_VISION_MODEL=$(OLLAMA_VISION_MODEL) \
@@ -131,4 +132,5 @@ help:
 	@echo "  ARGS=\"--limit 50\"                                    probe only 50 files"
 	@echo "  ARGS=\"--workers 40\"                                  increase parallelism"
 	@echo "  ARGS=\"--retry-errors\"                               re-analyse previously failed vision files"
+	@echo "  ARGS=\"--vision-workers 4\"                          parallel vision workers (GPU hosts only)"
 	@echo ""
