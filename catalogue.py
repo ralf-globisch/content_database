@@ -346,7 +346,7 @@ def parse_ffprobe(data: dict, mediainfo_tracks: dict | None = None) -> dict:
 
     # all audio tracks
     audio_tracks = _parse_audio_tracks(streams)
-    primary = audio_tracks[0] if audio_tracks else {}
+    primary = max(audio_tracks, key=lambda t: t.get("channels") or 0) if audio_tracks else {}
 
     return {
         "duration_s": float(fmt["duration"]) if fmt.get("duration") else None,
