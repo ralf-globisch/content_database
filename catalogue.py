@@ -771,8 +771,16 @@ def run_vision_phase(
     workers: int,
     limit: int | None,
     no_dedup: bool = False,
+    retry_errors: bool = False,
 ) -> None:
     s3 = _s3_client(profile)
+
+    if retry_errors:
+        deleted = con.execute(
+            "DELETE FROM content_vision WHERE description LIKE '[error:%' RETURNING s3_key"
+        ).fetchall()
+        if deleted:
+            log.info("Cleared %d error sentinel row(s) — will re-analyse.", len(deleted))
 
     rows = con.execute("""
         SELECT f.s3_key, m.duration_s, m.width, m.height, f.size_bytes
@@ -964,6 +972,8 @@ def main() -> None:
                         help="Cap files to probe (useful for testing)")
     parser.add_argument("--no-dedup", action="store_true",
                         help="Skip variant grouping and classify every video file individually")
+    parser.add_argument("--retry-errors", action="store_true",
+                        help="Clear error sentinel rows before running vision so failed files are re-analysed")
     args = parser.parse_args()
 
     con = init_db(args.db)
@@ -981,7 +991,7 @@ def main() -> None:
     if args.phase == "vision":
         vision_workers = min(args.workers, 1)  # vision models crash under parallel load on CPU-only hosts
         run_vision_phase(con, args.bucket, args.profile, vision_workers, args.limit,
-                         no_dedup=args.no_dedup)
+                         no_dedup=args.no_dedup, retry_errors=args.retry_errors)
 
     if args.phase in ("summary", "both"):
         print_summary(con)

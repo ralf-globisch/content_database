@@ -130,4 +130,5 @@ help:
 	@echo "  ARGS=\"--prefix analysis/jan-ozer-per-title-files/\"   scope to a prefix"
 	@echo "  ARGS=\"--limit 50\"                                    probe only 50 files"
 	@echo "  ARGS=\"--workers 40\"                                  increase parallelism"
+	@echo "  ARGS=\"--retry-errors\"                               re-analyse previously failed vision files"
 	@echo ""
