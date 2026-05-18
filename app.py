@@ -52,7 +52,7 @@ Rules:
 
 
 def _generate_sql(nl_query: str) -> str:
-    client = _ollama.Client(host=OLLAMA_HOST)
+    client = _ollama.Client(host=OLLAMA_HOST, timeout=20.0)
     resp = client.chat(
         model=SQL_MODEL,
         messages=[
