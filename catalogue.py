@@ -727,7 +727,15 @@ def _group_by_content(
         dirs = {item[0].rsplit("/", 1)[0] if "/" in item[0] else "" for item in items}
 
         if len(dirs) <= 1:
-            # Tier 1: all files in same directory — high confidence, no hash needed
+            # Tier 1: same directory — only group if filenames share a common prefix,
+            # otherwise same-duration coincidences (e.g. intro.mp4 + feature.mp4)
+            # would be wrongly treated as variants.
+            if len(items) > 1:
+                prefix = _common_filename_prefix([item[0] for item in items])
+                if len(prefix) < 4:
+                    for item in items:
+                        groups.append((item[0], item[1], []))
+                    continue
             items.sort(key=lambda x: ((x[2] or 0) * (x[3] or 0), x[4] or 0), reverse=True)
             groups.append((items[0][0], items[0][1], [x[0] for x in items[1:]]))
         else:
