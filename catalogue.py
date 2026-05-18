@@ -787,7 +787,9 @@ def run_vision_phase(
             rep_key, variants = futures[future]
             key, result = future.result()
             if "_error" in result:
-                log.warning("[%d/%d] ERR %s: %s", i, len(todo_groups), key, result["_error"])
+                err = result["_error"]
+                log.warning("[%d/%d] ERR %s: %s", i, len(todo_groups), key, err)
+                batch.append((key, f"[error: {err}]", None, None, None, [], now, None))
                 continue
 
             row = (
