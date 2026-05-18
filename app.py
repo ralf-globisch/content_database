@@ -160,6 +160,7 @@ if HAS_NL:
                 try:
                     generated = _generate_sql(nl_query.strip())
                     st.session_state["sql_area"] = generated
+                    st.session_state["_nl_generated"] = True
                     st.session_state["page"] = 1
                 except Exception as e:
                     st.error(f"SQL generation failed: {e}")
@@ -171,14 +172,16 @@ choice = st.selectbox(
     "Saved query",
     ["— ad hoc —"] + list(saved.keys()),
     format_func=lambda k: k if k == "— ad hoc —" else saved[k]["label"],
+    key="query_choice",
 )
 
 if st.session_state.get("last_choice") != choice:
-    st.session_state["sql_area"] = (
-        "SELECT * FROM media_files LIMIT 20"
-        if choice == "— ad hoc —"
-        else saved[choice]["sql"]
-    )
+    if not st.session_state.pop("_nl_generated", False):
+        st.session_state["sql_area"] = (
+            "SELECT * FROM media_files LIMIT 20"
+            if choice == "— ad hoc —"
+            else saved[choice]["sql"]
+        )
     st.session_state["last_choice"] = choice
     st.session_state["page"] = 1
 
