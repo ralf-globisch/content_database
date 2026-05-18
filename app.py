@@ -77,6 +77,28 @@ def _generate_sql(nl_query: str) -> str:
 st.set_page_config(page_title="Content Catalogue", layout="wide")
 st.title("Content Catalogue")
 
+try:
+    _s = get_conn().execute("""
+        SELECT
+            count(*) FILTER (WHERE f.media_type = 'video')           AS video_files,
+            count(*) FILTER (WHERE f.media_type = 'audio')           AS audio_files,
+            round(sum(f.size_bytes) / 1e9, 1)                        AS total_gb,
+            sum(m.duration_s) FILTER (WHERE f.media_type = 'video')  AS video_s
+        FROM media_files f
+        LEFT JOIN media_metadata m USING (s3_key)
+    """).fetchone()
+    if _s and _s[0]:
+        _h, _rem = divmod(int(_s[3] or 0), 3600)
+        _m = _rem // 60
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Video files",    f"{_s[0]:,}")
+        c2.metric("Audio files",    f"{_s[1]:,}")
+        c3.metric("Total size",     f"{_s[2]} GB")
+        c4.metric("Total duration", f"{_h:,}h {_m:02d}m")
+        st.write("")
+except Exception:
+    pass
+
 
 @st.cache_resource
 def get_conn():

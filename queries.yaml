@@ -2,11 +2,13 @@ summary:
   label: "Summary — counts and sizes by media type"
   sql: |
     SELECT
-      media_type,
-      count(*)                              AS files,
-      round(sum(size_bytes)  / 1e9, 2)     AS total_gb,
-      round(avg(size_bytes)  / 1e6, 1)     AS avg_mb
-    FROM media_files
+      f.media_type,
+      count(*)                               AS files,
+      round(sum(f.size_bytes)  / 1e9, 2)    AS total_gb,
+      round(avg(f.size_bytes)  / 1e6, 1)    AS avg_mb,
+      round(sum(m.duration_s)  / 3600,  1)  AS total_hours
+    FROM media_files f
+    LEFT JOIN media_metadata m USING (s3_key)
     GROUP BY 1
     ORDER BY 2 DESC
 
