@@ -38,7 +38,7 @@ DOCKER_RUN := docker run --rm \
 	-v "$(DB_DIR):/data" \
 	$(IMAGE)
 
-.PHONY: build inventory metadata vision both summary query shell ui help check-auth
+.PHONY: build inventory metadata vision both summary query shell ui ui-local help check-auth
 
 check-auth:
 	@aws sts get-caller-identity > /dev/null || \
@@ -99,7 +99,7 @@ shell: $(DB_DIR)
 	docker run --rm -it -v "$(DB_DIR):/data" \
 		--entrypoint python $(IMAGE) -m duckdb $(DB_FILE)
 
-## Open the Streamlit query UI (http://localhost:8501)
+## Open the Streamlit query UI (http://localhost:8501) — runs inside Docker
 ## Natural language search requires Ollama running on host with: ollama pull llama3.2
 ui: $(DB_DIR)
 	docker run --rm -it -p 8501:8501 \
@@ -110,6 +110,17 @@ ui: $(DB_DIR)
 		run /app/app.py \
 		--server.address=0.0.0.0 \
 		--server.headless=true
+
+## Open the Streamlit query UI running directly on the host (http://localhost:8501)
+## Use this when Ollama is running locally — avoids Docker networking issues
+ui-local: $(DB_DIR)
+	DB_PATH=$(CURDIR)/data/content_catalogue.duckdb \
+	QUERIES_PATH=$(CURDIR)/queries.yaml \
+	OLLAMA_HOST=$(OLLAMA_HOST) \
+	OLLAMA_SQL_MODEL=$(OLLAMA_SQL_MODEL) \
+	CLAUDE_SQL_MODEL=$(CLAUDE_SQL_MODEL) \
+	$(if $(ANTHROPIC_API_KEY),ANTHROPIC_API_KEY=$(ANTHROPIC_API_KEY),) \
+	streamlit run app.py
 
 $(DB_DIR):
 	mkdir -p $(DB_DIR)
@@ -125,7 +136,8 @@ help:
 	@echo "  make summary                        Print collected stats"
 	@echo "  make query Q=\"<sql>\"                 Run a SQL query on the DB"
 	@echo "  make shell                          Open interactive DuckDB shell"
-	@echo "  make ui                             Open Streamlit query UI (http://localhost:8501)"
+	@echo "  make ui                             Open Streamlit query UI in Docker (http://localhost:8501)"
+	@echo "  make ui-local                       Open Streamlit query UI on host (avoids Docker networking)"
 	@echo ""
 	@echo "AWS credentials (pick one):"
 	@echo "  export AWS_PROFILE=my-profile"
