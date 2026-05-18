@@ -305,6 +305,19 @@ vision_genre_detail:
     WHERE v.genre_tags IS NOT NULL
     ORDER BY genre, f.size_bytes DESC
 
+vision_errors:
+  label: "Vision — files that failed analysis (error sentinels)"
+  sql: |
+    SELECT
+      v.s3_key,
+      v.description,
+      v.analyzed_at,
+      round(f.size_bytes / 1e6, 1)  AS size_mb
+    FROM content_vision v
+    JOIN media_files f USING (s3_key)
+    WHERE v.description LIKE '[error:%'
+    ORDER BY v.analyzed_at DESC
+
 unanalyzed_files:
   label: "Vision — files not yet analyzed"
   sql: |
