@@ -491,32 +491,33 @@ def run_metadata_phase(
 # ---------------------------------------------------------------------------
 
 OLLAMA_HOST         = os.environ.get("OLLAMA_HOST",         "http://localhost:11434")
-OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "llava")
+OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "moondream")
 OLLAMA_SQL_MODEL    = os.environ.get("OLLAMA_SQL_MODEL",    "llama3.2")
 
 HASH_MATCH_THRESHOLD = 10  # max dHash bit distance (out of 64) to consider files same-source
 
 _VISION_PROMPT = """\
-Analyse these video frames and output ONLY a JSON object with exactly these fields \
-(no markdown, no explanation, start with {):
+Describe what you see in these video frames. Include: what is happening, \
+whether there is any text or credits visible, how bright or dark the image is, \
+and what kind of content this appears to be (e.g. movie, TV show, sports, documentary, \
+animation, commercial). Be concise and factual."""
 
-{
-  "description": "2-3 sentences describing the video content",
-  "style": "live_action",
-  "has_credits": false,
-  "brightness": "normal",
-  "genre_tags": ["drama"]
-}
+_STRUCTURE_PROMPT = """\
+Given this description of video frames, respond with ONLY a JSON object — no markdown.
 
-Field rules:
-- style: one of live_action, animated, cgi, mixed
-- has_credits: true if any frame shows title cards or scrolling credits text
-- brightness: one of bright, normal, dark, mixed
-- genre_tags: 1-5 tags from: action, drama, comedy, documentary, sports, news, \
-animation, nature, music, commercial, trailer, educational, gaming, film"""
+Description: {description}
+Filename: {filename}
 
-_VISION_RETRY = "Your previous response was not valid JSON. \
-Output ONLY the JSON object. Start with { and end with }. No other text."
+{{
+  "description": "2-3 sentence summary",
+  "style": "live_action or animated or cgi or mixed",
+  "has_credits": true or false,
+  "brightness": "bright or normal or dark or mixed",
+  "genre_tags": ["tag1", "tag2"]
+}}
+
+For genre_tags pick 1-5 from: action, drama, comedy, documentary, sports, news, \
+animation, nature, music, commercial, trailer, educational, gaming, film."""
 
 
 def _extract_json(text: str) -> dict:
@@ -536,7 +537,9 @@ def _extract_json(text: str) -> dict:
 def extract_frame_base64(url: str, offset_s: float) -> str | None:
     """Extract one JPEG frame at offset_s seconds from a URL, return base64 or None."""
     cmd = [
-        "ffmpeg", "-v", "quiet",
+        "docker", "run", "--rm", "--entrypoint", "ffmpeg",
+        "content-catalogue",
+        "-v", "quiet",
         "-ss", str(int(offset_s)),
         "-i", url,
         "-frames:v", "1",
@@ -549,6 +552,7 @@ def extract_frame_base64(url: str, offset_s: float) -> str | None:
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=60)
         if r.returncode != 0 or not r.stdout:
+            log.warning("ffmpeg failed (rc=%d): %s", r.returncode, r.stderr.decode(errors="replace")[-500:])
             return None
         return base64.b64encode(r.stdout).decode()
     except Exception:
@@ -556,44 +560,38 @@ def extract_frame_base64(url: str, offset_s: float) -> str | None:
 
 
 def analyze_frames(frames_b64: list[str], filename: str) -> dict:
-    """Classify video frames using the Ollama vision model, return parsed JSON."""
+    """Classify video frames: vision model describes, SQL model structures."""
     try:
         import ollama
     except ImportError:
         raise RuntimeError("pip install ollama")
 
     client = ollama.Client(host=OLLAMA_HOST)
-    first_msg = {
-        "role": "user",
-        "content": f"File: {filename}\n\n{_VISION_PROMPT}",
-        "images": frames_b64,
-    }
 
-    # Attempt 1: ask Ollama to enforce JSON at the server level
-    try:
-        resp = client.chat(model=OLLAMA_VISION_MODEL, messages=[first_msg], format="json")
-        return _extract_json(resp.message.content)
-    except Exception:
-        pass
-
-    # Attempt 2: plain chat without format enforcement
-    resp = client.chat(model=OLLAMA_VISION_MODEL, messages=[first_msg])
-    try:
-        return _extract_json(resp.message.content)
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # Attempt 3: follow-up nudge asking the model to fix its output
-    resp2 = client.chat(
+    # Step 1: vision model — describe what's in the frames
+    vision_resp = client.chat(
         model=OLLAMA_VISION_MODEL,
-        messages=[
-            first_msg,
-            {"role": "assistant", "content": resp.message.content},
-            {"role": "user", "content": _VISION_RETRY},
-        ],
+        messages=[{
+            "role": "user",
+            "content": _VISION_PROMPT,
+            "images": frames_b64,
+        }],
+    )
+    description = vision_resp.message.content.strip()
+
+    # Step 2: text model — extract structured JSON from the description
+    struct_resp = client.chat(
+        model=OLLAMA_SQL_MODEL,
+        messages=[{
+            "role": "user",
+            "content": _STRUCTURE_PROMPT.format(
+                description=description,
+                filename=filename,
+            ),
+        }],
         format="json",
     )
-    return _extract_json(resp2.message.content)
+    return _extract_json(struct_resp.message.content)
 
 
 def already_vision_analyzed(con: duckdb.DuckDBPyConnection) -> set[str]:
@@ -944,7 +942,7 @@ def main() -> None:
         run_metadata_phase(con, args.bucket, args.profile, args.workers, args.limit)
 
     if args.phase == "vision":
-        vision_workers = min(args.workers, 5)  # respect Claude API rate limits
+        vision_workers = min(args.workers, 1)  # vision models crash under parallel load on CPU-only hosts
         run_vision_phase(con, args.bucket, args.profile, vision_workers, args.limit,
                          no_dedup=args.no_dedup)
 
