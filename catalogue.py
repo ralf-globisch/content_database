@@ -737,6 +737,7 @@ def run_vision_phase(
     profile: str | None,
     workers: int,
     limit: int | None,
+    no_dedup: bool = False,
 ) -> None:
     s3 = _s3_client(profile)
 
@@ -748,7 +749,10 @@ def run_vision_phase(
     """).fetchall()
 
     done = already_vision_analyzed(con)
-    all_groups = _group_by_content(rows, s3_client=s3, bucket=bucket)
+    if no_dedup:
+        all_groups = [(key, dur, []) for key, dur, w, h, sz in rows]
+    else:
+        all_groups = _group_by_content(rows, s3_client=s3, bucket=bucket)
     todo_groups = [(rep, dur, variants) for rep, dur, variants in all_groups if rep not in done]
     if limit:
         todo_groups = todo_groups[:limit]
@@ -923,6 +927,8 @@ def main() -> None:
     )
     parser.add_argument("--limit", type=int, default=None,
                         help="Cap files to probe (useful for testing)")
+    parser.add_argument("--no-dedup", action="store_true",
+                        help="Skip variant grouping and classify every video file individually")
     args = parser.parse_args()
 
     con = init_db(args.db)
@@ -939,7 +945,8 @@ def main() -> None:
 
     if args.phase == "vision":
         vision_workers = min(args.workers, 5)  # respect Claude API rate limits
-        run_vision_phase(con, args.bucket, args.profile, vision_workers, args.limit)
+        run_vision_phase(con, args.bucket, args.profile, vision_workers, args.limit,
+                         no_dedup=args.no_dedup)
 
     if args.phase in ("summary", "both"):
         print_summary(con)
