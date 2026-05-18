@@ -33,16 +33,18 @@ Database tables:
     language TEXT  -- ISO code e.g. 'eng', dolby_atmos BOOL, dolby_codec_family TEXT)
 
   content_vision(s3_key PK, description TEXT,
-    style TEXT       -- 'live_action', 'animated', 'cgi', 'mixed'
-    has_credits BOOL -- true if ending/opening credits were detected
-    brightness TEXT  -- 'bright', 'normal', 'dark', 'mixed'
-    genre_tags VARCHAR[]  -- e.g. ['drama', 'action']  use list_contains(genre_tags, 'sports') to search
-    analyzed_at TEXT)
+    style TEXT,      -- 'live_action', 'animated', 'cgi', 'mixed'
+    has_credits BOOL, -- true if ending/opening credits were detected
+    brightness TEXT,  -- 'bright', 'normal', 'dark', 'mixed'
+    genre_tags VARCHAR[],  -- e.g. ['drama', 'action']  use list_contains(genre_tags, 'sports') to search
+    analyzed_at TEXT,
+    source_key TEXT)  -- non-NULL means this row is a copy; source_key points to the analysed representative
 
 Rules:
 - Return ONLY the SQL statement, no explanation, no markdown fences.
 - Use DuckDB syntax (list_contains for array search, :: for casting).
-- JOIN tables via s3_key when needed."""
+- JOIN tables via s3_key when needed.
+- NEVER use 'at' as a table alias — it is a reserved keyword in DuckDB. Use 'atr' for audio_tracks."""
 
 
 def _generate_sql(nl_query: str) -> str:
