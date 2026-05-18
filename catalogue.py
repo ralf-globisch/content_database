@@ -676,6 +676,16 @@ def _confirm_with_hash(
     return list(by_dir.values())
 
 
+def _common_filename_prefix(keys: list[str]) -> str:
+    """Common prefix of bare filenames (no extension, no path), trimmed to last word boundary."""
+    stems = [os.path.basename(k).rsplit(".", 1)[0] for k in keys]
+    prefix = os.path.commonprefix(stems)
+    for i in range(len(prefix) - 1, -1, -1):
+        if prefix[i] in ("_", "-") or (i > 0 and prefix[i].isdigit() and not prefix[i - 1].isdigit()):
+            return prefix[:i]
+    return prefix
+
+
 def _group_by_content(
     rows: list[tuple],
     s3_client=None,
@@ -712,6 +722,14 @@ def _group_by_content(
             items.sort(key=lambda x: ((x[2] or 0) * (x[3] or 0), x[4] or 0), reverse=True)
             groups.append((items[0][0], items[0][1], [x[0] for x in items[1:]]))
         else:
+            # Tier 1.5: cross-directory but shared filename prefix → same content, no hash
+            prefix = _common_filename_prefix([item[0] for item in items])
+            if len(prefix) >= 4:
+                log.info("Cross-dir prefix match (%r): %d files → 1 group", prefix, len(items))
+                items.sort(key=lambda x: ((x[2] or 0) * (x[3] or 0), x[4] or 0), reverse=True)
+                groups.append((items[0][0], items[0][1], [x[0] for x in items[1:]]))
+                continue
+
             # Tier 2: files across multiple directories — confirm with perceptual hash
             if s3_client and bucket and dur_key is not None:
                 sub_groups = _confirm_with_hash(items, s3_client, bucket, dur_key)
