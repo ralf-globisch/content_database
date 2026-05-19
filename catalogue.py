@@ -11,6 +11,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -392,6 +393,34 @@ _EMPTY_META: dict = {
 
 _MAX_PROBE_RETRIES = 3
 
+# XML root tags that confirm a Dolby Vision sidecar
+_DV_XML_ROOTS = ("DolbyLabsMDF", "DolbyVisionStudio")
+
+
+def _check_dv_sidecar(s3_client, bucket: str, key: str) -> bool:
+    """Return True if a Dolby Vision XML sidecar exists in the same S3 directory."""
+    directory = key.rsplit("/", 1)[0] + "/" if "/" in key else ""
+    try:
+        resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=directory)
+        xml_keys = [
+            obj["Key"] for obj in resp.get("Contents", [])
+            if obj["Key"].lower().endswith(".xml") and obj["Key"] != key
+        ]
+    except Exception:
+        return False
+
+    for xml_key in xml_keys:
+        try:
+            # Read only the first 4 KB — enough to find the root element
+            obj = s3_client.get_object(Bucket=bucket, Key=xml_key, Range="bytes=0-4095")
+            text = obj["Body"].read().decode("utf-8", errors="ignore")
+            if any(root in text for root in _DV_XML_ROOTS):
+                log.info("DV sidecar detected: %s", xml_key)
+                return True
+        except Exception:
+            continue
+    return False
+
 
 def probe_one(s3_client, bucket: str, key: str) -> tuple[str, dict]:
     last_exc: Exception | None = None
@@ -400,7 +429,11 @@ def probe_one(s3_client, bucket: str, key: str) -> tuple[str, dict]:
             url = presign(s3_client, bucket, key)
             ffprobe_data = run_ffprobe(url)
             mediainfo_tracks = run_mediainfo(url) if MEDIAINFO_AVAILABLE else None
-            return key, parse_ffprobe(ffprobe_data, mediainfo_tracks)
+            meta = parse_ffprobe(ffprobe_data, mediainfo_tracks)
+            if not meta.get("dolby_vision") and _check_dv_sidecar(s3_client, bucket, key):
+                meta["dolby_vision"] = True
+                meta["hdr_format"] = "Dolby Vision"
+            return key, meta
         except Exception as exc:
             last_exc = exc
             if attempt < _MAX_PROBE_RETRIES - 1:
