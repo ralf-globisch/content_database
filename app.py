@@ -1,7 +1,14 @@
+import base64
 import os
 import duckdb
 import streamlit as st
 import yaml
+
+try:
+    import plotly.express as px
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
 
 DB_PATH           = os.environ.get("DB_PATH",           "/data/content_catalogue.duckdb")
 QUERIES_PATH      = os.environ.get("QUERIES_PATH",      "/app/queries.yaml")
@@ -144,8 +151,93 @@ def get_conn():
     return duckdb.connect(DB_PATH, read_only=True)
 
 
-st.set_page_config(page_title="Content Catalogue", layout="wide")
-st.title("Content Catalogue")
+st.set_page_config(page_title="BitQuery", layout="wide")
+
+st.markdown("""
+<style>
+/* ── Page background ── */
+[data-testid="stAppViewContainer"] { background: #0d1117; }
+[data-testid="stSidebar"]          { background: #161b22; }
+
+/* ── Metric cards ── */
+[data-testid="metric-container"] {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 1rem 1.2rem;
+}
+[data-testid="stMetricValue"] {
+    color: #58a6ff !important;
+    font-size: 1.8rem !important;
+    font-weight: 700 !important;
+}
+[data-testid="stMetricLabel"] { color: #8b949e !important; }
+
+/* ── Expanders ── */
+[data-testid="stExpander"] {
+    background: #161b22;
+    border: 1px solid #30363d !important;
+    border-radius: 10px;
+    margin-bottom: 0.8rem;
+}
+
+/* ── Buttons ── */
+[data-testid="stButton"] > button[kind="primary"] {
+    background: linear-gradient(135deg, #58a6ff, #a371f7);
+    border: none;
+    color: #0d1117;
+    font-weight: 700;
+    border-radius: 6px;
+}
+[data-testid="stButton"] > button[kind="primary"]:hover {
+    opacity: 0.88;
+    transform: translateY(-1px);
+}
+
+/* ── Text input / text area ── */
+[data-testid="stTextInput"] input,
+[data-testid="stTextArea"]  textarea {
+    background: #0d1117 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 6px;
+    color: #e6edf3 !important;
+}
+
+/* ── Dataframe ── */
+[data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
+
+/* ── Selectbox ── */
+[data-testid="stSelectbox"] > div > div {
+    background: #161b22 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 6px;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #0d1117; }
+::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #58a6ff; }
+</style>
+""", unsafe_allow_html=True)
+
+_logo_path = os.path.join(os.path.dirname(__file__), "bitmovin_logo.svg")
+_logo_b64 = base64.b64encode(open(_logo_path, "rb").read()).decode()
+st.markdown(f"""
+<div style="display:flex; align-items:center; gap:18px; margin-bottom:0.5rem;">
+  <img src="data:image/svg+xml;base64,{_logo_b64}"
+       style="height:36px; filter:brightness(0) invert(1);" />
+  <span style="
+    background: linear-gradient(90deg, #58a6ff 0%, #a371f7 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-size: 2.2rem;
+    font-weight: 800;
+    letter-spacing: -0.5px;
+    line-height: 1;
+  ">BitQuery</span>
+</div>
+""", unsafe_allow_html=True)
 
 try:
     _s = get_conn().execute("""
@@ -169,6 +261,121 @@ try:
 except Exception:
     pass
 
+
+if HAS_PLOTLY:
+    with st.expander("Charts", expanded=True):
+        _chart_left, _chart_right = st.columns(2)
+
+        # --- Genre bar chart ---
+        with _chart_left:
+            try:
+                _genres = get_conn().execute("""
+                    SELECT genre, count(*) AS files
+                    FROM (
+                        SELECT UNNEST(genre_tags) AS genre
+                        FROM content_vision
+                        WHERE genre_tags IS NOT NULL
+                          AND len(genre_tags) > 0
+                          AND description NOT LIKE '[error:%'
+                    )
+                    GROUP BY genre
+                    ORDER BY files DESC
+                    LIMIT 20
+                """).df()
+                if not _genres.empty:
+                    _fig_genre = px.bar(
+                        _genres,
+                        x="files",
+                        y="genre",
+                        orientation="h",
+                        title="Content by Genre",
+                        color="files",
+                        color_continuous_scale="Blues",
+                        labels={"files": "Files", "genre": ""},
+                    )
+                    _fig_genre.update_layout(
+                        showlegend=False,
+                        coloraxis_showscale=False,
+                        margin=dict(l=0, r=0, t=40, b=0),
+                        yaxis=dict(autorange="reversed"),
+                        paper_bgcolor="#161b22",
+                        plot_bgcolor="#161b22",
+                        font=dict(color="#e6edf3"),
+                        title_font=dict(color="#58a6ff"),
+                    )
+                    st.plotly_chart(_fig_genre, use_container_width=True)
+                else:
+                    st.caption("No genre data yet — run `make vision` to populate genre tags.")
+            except Exception as _e:
+                st.caption(f"Genre chart unavailable: {_e}")
+
+        # --- Content map scatter ---
+        with _chart_right:
+            try:
+                _map = get_conn().execute("""
+                    SELECT
+                        f.s3_key,
+                        round(m.duration_s / 60, 1)    AS duration_min,
+                        round(f.size_bytes / 1e9, 2)   AS size_gb,
+                        coalesce(m.hdr_format, 'SDR')  AS hdr_format,
+                        coalesce(
+                            CASE
+                                WHEN m.height >= 2160 THEN '4K'
+                                WHEN m.height >= 1080 THEN '1080p'
+                                WHEN m.height >=  720 THEN '720p'
+                                ELSE 'SD'
+                            END, 'Unknown'
+                        )                              AS resolution_tier,
+                        m.video_codec
+                    FROM media_files f
+                    JOIN media_metadata m USING (s3_key)
+                    WHERE f.media_type = 'video'
+                      AND m.duration_s IS NOT NULL
+                      AND m.error IS NULL
+                """).df()
+                if not _map.empty:
+                    _fig_map = px.scatter(
+                        _map,
+                        x="duration_min",
+                        y="size_gb",
+                        color="hdr_format",
+                        symbol="resolution_tier",
+                        hover_name="s3_key",
+                        hover_data={"video_codec": True, "duration_min": True, "size_gb": True},
+                        title="Content Map — Duration vs Size",
+                        labels={
+                            "duration_min": "Duration (minutes)",
+                            "size_gb": "File size (GB)",
+                            "hdr_format": "HDR",
+                            "resolution_tier": "Resolution",
+                        },
+                        color_discrete_map={
+                            "SDR": "#4C78A8",
+                            "HDR10": "#F58518",
+                            "HDR10+": "#E45756",
+                            "HLG": "#72B7B2",
+                            "Dolby Vision": "#B279A2",
+                        },
+                    )
+                    _fig_map.update_layout(
+                        margin=dict(l=0, r=0, t=40, b=0),
+                        paper_bgcolor="#161b22",
+                        plot_bgcolor="#161b22",
+                        font=dict(color="#e6edf3"),
+                        title_font=dict(color="#58a6ff"),
+                        legend=dict(
+                            bgcolor="#0d1117",
+                            bordercolor="#30363d",
+                            borderwidth=1,
+                        ),
+                    )
+                    _fig_map.update_xaxes(gridcolor="#21262d", zerolinecolor="#30363d")
+                    _fig_map.update_yaxes(gridcolor="#21262d", zerolinecolor="#30363d")
+                    st.plotly_chart(_fig_map, use_container_width=True)
+                else:
+                    st.caption("No metadata yet — run `make metadata` first.")
+            except Exception:
+                pass
 
 with open(QUERIES_PATH) as f:
     saved = yaml.safe_load(f)
