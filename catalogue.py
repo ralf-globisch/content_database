@@ -543,6 +543,41 @@ CLAUDE_VISION_MODEL = os.environ.get("CLAUDE_VISION_MODEL", "claude-haiku-4-5-20
 
 HASH_MATCH_THRESHOLD = 10  # max dHash bit distance (out of 64) to consider files same-source
 
+
+def _check_vision_requirements(hash_dedup: bool = False) -> None:
+    """Fail early with a clear message if vision-phase packages are not installed."""
+    missing = []
+
+    if ANTHROPIC_API_KEY:
+        try:
+            import anthropic  # noqa: F401
+        except ImportError:
+            missing.append("anthropic")
+    else:
+        try:
+            import ollama  # noqa: F401
+        except ImportError:
+            missing.append("ollama")
+
+    if hash_dedup:
+        try:
+            import imagehash  # noqa: F401
+        except ImportError:
+            missing.append("imagehash")
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            missing.append("Pillow")
+
+    if missing:
+        pkgs = " ".join(missing)
+        raise SystemExit(
+            f"\nERROR: Missing Python package(s): {pkgs}\n"
+            f"  Run:  pip install -r requirements.txt\n"
+            f"  Or:   pip install {pkgs}\n"
+        )
+
+
 _VISION_PROMPT = """\
 Describe what you see in these video frames. Include: what is happening, \
 whether opening or closing title credit sequences are visible (NOT regular subtitles, \
@@ -1095,6 +1130,7 @@ def main() -> None:
         run_metadata_phase(con, args.bucket, args.profile, args.workers, args.limit)
 
     if args.phase == "vision":
+        _check_vision_requirements(hash_dedup=args.hash_dedup)
         run_vision_phase(con, args.bucket, args.profile, args.vision_workers, args.limit,
                          no_dedup=args.no_dedup, retry_errors=args.retry_errors,
                          hash_dedup=args.hash_dedup)
