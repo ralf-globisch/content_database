@@ -263,117 +263,279 @@ except Exception:
 
 
 if HAS_PLOTLY:
-    with st.expander("Charts", expanded=True):
-        _chart_left, _chart_right = st.columns(2)
+    import pandas as _pd
 
-        # --- Genre bar chart ---
-        with _chart_left:
+    def _dark(extra: dict | None = None) -> dict:
+        base = dict(
+            paper_bgcolor="#161b22", plot_bgcolor="#161b22",
+            font=dict(color="#e6edf3"), title_font=dict(color="#58a6ff"),
+            margin=dict(l=0, r=0, t=40, b=0),
+            legend=dict(bgcolor="#0d1117", bordercolor="#30363d", borderwidth=1),
+        )
+        if extra:
+            base.update(extra)
+        return base
+
+    def _hbar(df, x, y, title, *, flip=True):
+        fig = px.bar(df, x=x, y=y, orientation="h", title=title,
+                     color=x, color_continuous_scale="Blues",
+                     labels={x: x.replace("_", " ").title(), y: ""})
+        fig.update_layout(**_dark({"showlegend": False, "coloraxis_showscale": False,
+                                   "yaxis": dict(autorange="reversed" if flip else True)}))
+        return fig
+
+    with st.expander("Charts", expanded=True):
+
+        # ── Row 1: Genre  |  Content map ──────────────────────────────────────
+        _c1, _c2 = st.columns(2)
+
+        with _c1:
             try:
-                _genres = get_conn().execute("""
+                _df = get_conn().execute("""
                     SELECT genre, count(*) AS files
-                    FROM (
-                        SELECT UNNEST(genre_tags) AS genre
-                        FROM content_vision
-                        WHERE genre_tags IS NOT NULL
-                          AND len(genre_tags) > 0
-                          AND description NOT LIKE '[error:%'
-                    )
-                    GROUP BY genre
-                    ORDER BY files DESC
-                    LIMIT 20
+                    FROM (SELECT UNNEST(genre_tags) AS genre FROM content_vision
+                          WHERE genre_tags IS NOT NULL AND len(genre_tags) > 0
+                            AND description NOT LIKE '[error:%')
+                    GROUP BY genre ORDER BY files DESC LIMIT 20
                 """).df()
-                if not _genres.empty:
-                    _fig_genre = px.bar(
-                        _genres,
-                        x="files",
-                        y="genre",
-                        orientation="h",
-                        title="Content by Genre",
-                        color="files",
-                        color_continuous_scale="Blues",
-                        labels={"files": "Files", "genre": ""},
-                    )
-                    _fig_genre.update_layout(
-                        showlegend=False,
-                        coloraxis_showscale=False,
-                        margin=dict(l=0, r=0, t=40, b=0),
-                        yaxis=dict(autorange="reversed"),
-                        paper_bgcolor="#161b22",
-                        plot_bgcolor="#161b22",
-                        font=dict(color="#e6edf3"),
-                        title_font=dict(color="#58a6ff"),
-                    )
-                    st.plotly_chart(_fig_genre, use_container_width=True)
+                if not _df.empty:
+                    st.plotly_chart(_hbar(_df, "files", "genre", "Content by Genre"),
+                                    use_container_width=True)
                 else:
-                    st.caption("No genre data yet — run `make vision` to populate genre tags.")
+                    st.caption("No genre data yet — run `make vision`.")
             except Exception as _e:
                 st.caption(f"Genre chart unavailable: {_e}")
 
-        # --- Content map scatter ---
-        with _chart_right:
+        with _c2:
             try:
-                _map = get_conn().execute("""
-                    SELECT
-                        f.s3_key,
-                        round(m.duration_s / 60, 1)    AS duration_min,
-                        round(f.size_bytes / 1e9, 2)   AS size_gb,
-                        coalesce(m.hdr_format, 'SDR')  AS hdr_format,
-                        coalesce(
-                            CASE
-                                WHEN m.height >= 2160 THEN '4K'
-                                WHEN m.height >= 1080 THEN '1080p'
-                                WHEN m.height >=  720 THEN '720p'
-                                ELSE 'SD'
-                            END, 'Unknown'
-                        )                              AS resolution_tier,
+                _df = get_conn().execute("""
+                    SELECT f.s3_key,
+                        round(m.duration_s / 60, 1)   AS duration_min,
+                        round(f.size_bytes / 1e9, 2)  AS size_gb,
+                        coalesce(m.hdr_format, 'SDR') AS hdr_format,
+                        coalesce(CASE WHEN m.height >= 2160 THEN '4K'
+                                      WHEN m.height >= 1080 THEN '1080p'
+                                      WHEN m.height >=  720 THEN '720p'
+                                      ELSE 'SD' END, 'Unknown') AS resolution_tier,
                         m.video_codec
-                    FROM media_files f
-                    JOIN media_metadata m USING (s3_key)
-                    WHERE f.media_type = 'video'
-                      AND m.duration_s IS NOT NULL
-                      AND m.error IS NULL
+                    FROM media_files f JOIN media_metadata m USING (s3_key)
+                    WHERE f.media_type = 'video' AND m.duration_s IS NOT NULL AND m.error IS NULL
                 """).df()
-                if not _map.empty:
-                    _fig_map = px.scatter(
-                        _map,
-                        x="duration_min",
-                        y="size_gb",
-                        color="hdr_format",
-                        symbol="resolution_tier",
+                if not _df.empty:
+                    _fig = px.scatter(_df, x="duration_min", y="size_gb",
+                        color="hdr_format", symbol="resolution_tier",
                         hover_name="s3_key",
                         hover_data={"video_codec": True, "duration_min": True, "size_gb": True},
                         title="Content Map — Duration vs Size",
-                        labels={
-                            "duration_min": "Duration (minutes)",
-                            "size_gb": "File size (GB)",
-                            "hdr_format": "HDR",
-                            "resolution_tier": "Resolution",
-                        },
-                        color_discrete_map={
-                            "SDR": "#4C78A8",
-                            "HDR10": "#F58518",
-                            "HDR10+": "#E45756",
-                            "HLG": "#72B7B2",
-                            "Dolby Vision": "#B279A2",
-                        },
-                    )
-                    _fig_map.update_layout(
-                        margin=dict(l=0, r=0, t=40, b=0),
-                        paper_bgcolor="#161b22",
-                        plot_bgcolor="#161b22",
-                        font=dict(color="#e6edf3"),
-                        title_font=dict(color="#58a6ff"),
-                        legend=dict(
-                            bgcolor="#0d1117",
-                            bordercolor="#30363d",
-                            borderwidth=1,
-                        ),
-                    )
-                    _fig_map.update_xaxes(gridcolor="#21262d", zerolinecolor="#30363d")
-                    _fig_map.update_yaxes(gridcolor="#21262d", zerolinecolor="#30363d")
-                    st.plotly_chart(_fig_map, use_container_width=True)
+                        labels={"duration_min": "Duration (min)", "size_gb": "Size (GB)",
+                                "hdr_format": "HDR", "resolution_tier": "Resolution"},
+                        color_discrete_map={"SDR": "#4C78A8", "HDR10": "#F58518",
+                                            "HDR10+": "#E45756", "HLG": "#72B7B2",
+                                            "Dolby Vision": "#B279A2"})
+                    _fig.update_layout(**_dark())
+                    _fig.update_xaxes(gridcolor="#21262d", zerolinecolor="#30363d")
+                    _fig.update_yaxes(gridcolor="#21262d", zerolinecolor="#30363d")
+                    st.plotly_chart(_fig, use_container_width=True)
                 else:
-                    st.caption("No metadata yet — run `make metadata` first.")
+                    st.caption("No metadata yet — run `make metadata`.")
+            except Exception:
+                pass
+
+        # ── Row 2: Codec  |  HDR donut ────────────────────────────────────────
+        _c1, _c2 = st.columns(2)
+
+        with _c1:
+            try:
+                _df = get_conn().execute("""
+                    SELECT video_codec, count(*) AS files
+                    FROM media_metadata WHERE video_codec IS NOT NULL
+                    GROUP BY video_codec ORDER BY files DESC
+                """).df()
+                if not _df.empty:
+                    st.plotly_chart(_hbar(_df, "files", "video_codec", "Video Codec Distribution"),
+                                    use_container_width=True)
+            except Exception:
+                pass
+
+        with _c2:
+            try:
+                _df = get_conn().execute("""
+                    SELECT coalesce(hdr_format, 'SDR') AS hdr_format, count(*) AS files
+                    FROM media_metadata WHERE error IS NULL
+                    GROUP BY hdr_format ORDER BY files DESC
+                """).df()
+                if not _df.empty:
+                    _fig = px.pie(_df, names="hdr_format", values="files",
+                                  title="HDR Format Breakdown", hole=0.55,
+                                  color_discrete_map={"SDR": "#4C78A8", "HDR10": "#F58518",
+                                                      "HDR10+": "#E45756", "HLG": "#72B7B2",
+                                                      "Dolby Vision": "#B279A2"})
+                    _fig.update_layout(**_dark({"showlegend": True}))
+                    _fig.update_traces(textfont_color="#e6edf3")
+                    st.plotly_chart(_fig, use_container_width=True)
+            except Exception:
+                pass
+
+        # ── Row 3: Resolution treemap  |  Content over time ───────────────────
+        _c1, _c2 = st.columns(2)
+
+        with _c1:
+            try:
+                _df = get_conn().execute("""
+                    SELECT
+                        CASE WHEN height >= 2160 THEN '4K'
+                             WHEN height >= 1080 THEN '1080p'
+                             WHEN height >=  720 THEN '720p'
+                             ELSE 'SD' END                         AS tier,
+                        width::TEXT || 'x' || height::TEXT         AS resolution,
+                        count(*)                                   AS files
+                    FROM media_metadata
+                    WHERE width IS NOT NULL AND error IS NULL
+                    GROUP BY tier, resolution ORDER BY files DESC
+                """).df()
+                if not _df.empty:
+                    _fig = px.treemap(_df, path=["tier", "resolution"], values="files",
+                                      title="Resolution Distribution",
+                                      color="files", color_continuous_scale="Blues")
+                    _fig.update_layout(**_dark({"coloraxis_showscale": False}))
+                    _fig.update_traces(textfont_color="#e6edf3",
+                                       marker_line_color="#0d1117", marker_line_width=2)
+                    st.plotly_chart(_fig, use_container_width=True)
+            except Exception:
+                pass
+
+        with _c2:
+            try:
+                _df = get_conn().execute("""
+                    SELECT substr(last_modified, 1, 7) AS month, count(*) AS files
+                    FROM media_files
+                    GROUP BY month ORDER BY month
+                """).df()
+                if not _df.empty:
+                    _fig = px.area(_df, x="month", y="files", title="Content Added Over Time",
+                                   labels={"month": "", "files": "Files added"},
+                                   color_discrete_sequence=["#58a6ff"])
+                    _fig.update_layout(**_dark())
+                    _fig.update_xaxes(gridcolor="#21262d", zerolinecolor="#30363d")
+                    _fig.update_yaxes(gridcolor="#21262d", zerolinecolor="#30363d")
+                    _fig.update_traces(fillcolor="rgba(88,166,255,0.15)", line_width=2)
+                    st.plotly_chart(_fig, use_container_width=True)
+            except Exception:
+                pass
+
+        # ── Row 4: Bitrate by codec  |  Audio languages ───────────────────────
+        _c1, _c2 = st.columns(2)
+
+        with _c1:
+            try:
+                _df = get_conn().execute("""
+                    SELECT video_codec, round(video_bitrate / 1000.0, 1) AS bitrate_mbps
+                    FROM media_metadata
+                    WHERE video_codec IS NOT NULL AND video_bitrate IS NOT NULL
+                      AND video_bitrate > 0 AND error IS NULL
+                """).df()
+                if not _df.empty:
+                    _fig = px.box(_df, x="video_codec", y="bitrate_mbps",
+                                  color="video_codec", title="Bitrate by Codec (Mbps)",
+                                  labels={"video_codec": "", "bitrate_mbps": "Mbps"})
+                    _fig.update_layout(**_dark({"showlegend": False}))
+                    _fig.update_xaxes(gridcolor="#21262d")
+                    _fig.update_yaxes(gridcolor="#21262d", zerolinecolor="#30363d")
+                    st.plotly_chart(_fig, use_container_width=True)
+            except Exception:
+                pass
+
+        with _c2:
+            try:
+                _df = get_conn().execute("""
+                    SELECT coalesce(language, 'und') AS language, count(*) AS tracks
+                    FROM audio_tracks
+                    GROUP BY language ORDER BY tracks DESC LIMIT 15
+                """).df()
+                if not _df.empty:
+                    st.plotly_chart(_hbar(_df, "tracks", "language", "Audio Track Languages"),
+                                    use_container_width=True)
+            except Exception:
+                pass
+
+        # ── Row 5: Style × Brightness heatmap  |  Dolby coverage ──────────────
+        _c1, _c2 = st.columns(2)
+
+        with _c1:
+            try:
+                _df = get_conn().execute("""
+                    SELECT style, brightness, count(*) AS files
+                    FROM content_vision
+                    WHERE style IS NOT NULL AND brightness IS NOT NULL
+                      AND description NOT LIKE '[error:%'
+                    GROUP BY style, brightness
+                """).df()
+                if not _df.empty:
+                    _hm = _df.pivot_table(index="style", columns="brightness",
+                                          values="files", fill_value=0)
+                    _fig = px.imshow(_hm, text_auto=True, title="Style × Brightness",
+                                     color_continuous_scale="Blues",
+                                     labels={"x": "Brightness", "y": "Style", "color": "Files"})
+                    _fig.update_layout(**_dark({"coloraxis_showscale": False}))
+                    _fig.update_xaxes(side="bottom")
+                    st.plotly_chart(_fig, use_container_width=True)
+                else:
+                    st.caption("No vision data yet — run `make vision`.")
+            except Exception:
+                pass
+
+        with _c2:
+            try:
+                _df = get_conn().execute("""
+                    SELECT
+                        CASE WHEN dolby_vision AND dolby_atmos THEN 'Vision + Atmos'
+                             WHEN dolby_vision                 THEN 'Dolby Vision'
+                             WHEN dolby_atmos                  THEN 'Dolby Atmos'
+                             ELSE 'Neither' END AS dolby_tier,
+                        count(*) AS files
+                    FROM media_metadata WHERE error IS NULL
+                    GROUP BY dolby_tier ORDER BY files DESC
+                """).df()
+                if not _df.empty:
+                    _fig = px.bar(_df, x="dolby_tier", y="files", title="Dolby Format Coverage",
+                                  color="dolby_tier", text="files",
+                                  labels={"dolby_tier": "", "files": "Files"},
+                                  color_discrete_map={
+                                      "Vision + Atmos": "#B279A2",
+                                      "Dolby Vision":   "#a371f7",
+                                      "Dolby Atmos":    "#58a6ff",
+                                      "Neither":        "#30363d",
+                                  })
+                    _fig.update_layout(**_dark({"showlegend": False}))
+                    _fig.update_traces(textposition="outside", textfont_color="#e6edf3")
+                    _fig.update_yaxes(gridcolor="#21262d")
+                    st.plotly_chart(_fig, use_container_width=True)
+            except Exception:
+                pass
+
+        # ── Row 6: Content style donut ────────────────────────────────────────
+        _c1, _c2 = st.columns(2)
+
+        with _c1:
+            try:
+                _df = get_conn().execute("""
+                    SELECT style, count(*) AS files
+                    FROM content_vision
+                    WHERE style IS NOT NULL AND description NOT LIKE '[error:%'
+                    GROUP BY style ORDER BY files DESC
+                """).df()
+                if not _df.empty:
+                    _fig = px.pie(_df, names="style", values="files",
+                                  title="Content Style", hole=0.55,
+                                  color_discrete_map={"live_action": "#58a6ff",
+                                                      "animated":    "#F58518",
+                                                      "cgi":         "#B279A2",
+                                                      "mixed":       "#72B7B2"})
+                    _fig.update_layout(**_dark({"showlegend": True}))
+                    _fig.update_traces(textfont_color="#e6edf3")
+                    st.plotly_chart(_fig, use_container_width=True)
+                else:
+                    st.caption("No vision data yet — run `make vision`.")
             except Exception:
                 pass
 
