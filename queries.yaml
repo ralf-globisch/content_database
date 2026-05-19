@@ -107,6 +107,47 @@ files_hdr:
     WHERE m.hdr_format IS NOT NULL OR m.dolby_vision = true
     ORDER BY m.dolby_vision DESC, m.hdr_format, f.s3_key
 
+files_audio_summary:
+  label: "Audio — per-file summary (codec, channels, track count)"
+  sql: |
+    SELECT
+      f.s3_key,
+      m.video_codec,
+      m.width::TEXT || 'x' || m.height::TEXT          AS resolution,
+      round(m.duration_s, 1)                           AS duration_s,
+      count(a.track_index)                             AS audio_tracks,
+      string_agg(
+        coalesce(a.language, '?') || ':' ||
+        coalesce(a.codec, '?') || '/' ||
+        coalesce(a.channels::TEXT, '?') || 'ch',
+        '  '  ORDER BY a.track_index
+      )                                                AS tracks_detail,
+      bool_or(a.dolby_atmos)                           AS has_atmos,
+      round(f.size_bytes / 1e6, 1)                     AS size_mb
+    FROM media_files f
+    JOIN media_metadata m USING (s3_key)
+    LEFT JOIN audio_tracks a USING (s3_key)
+    WHERE f.media_type = 'video'
+    GROUP BY f.s3_key, m.video_codec, m.width, m.height, m.duration_s, f.size_bytes
+    ORDER BY audio_tracks DESC, f.size_bytes DESC
+
+files_audio_tracks:
+  label: "Audio — all tracks per file (one row per track)"
+  sql: |
+    SELECT
+      f.s3_key,
+      a.track_index,
+      coalesce(a.language, 'und')   AS language,
+      a.codec,
+      a.channels,
+      a.sample_rate                 AS sample_rate_hz,
+      a.dolby_atmos,
+      a.dolby_codec_family,
+      round(f.size_bytes / 1e6, 1)  AS size_mb
+    FROM audio_tracks a
+    JOIN media_files f USING (s3_key)
+    ORDER BY f.s3_key, a.track_index
+
 dolby_atmos:
   label: "Dolby Atmos — tracks (detail)"
   sql: |

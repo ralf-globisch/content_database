@@ -30,6 +30,8 @@ CLAUDE_SQL_MODEL    ?= claude-haiku-4-5-20251001
 CLAUDE_FLAGS := -e CLAUDE_SQL_MODEL=$(CLAUDE_SQL_MODEL) \
 	$(if $(ANTHROPIC_API_KEY),-e ANTHROPIC_API_KEY=$(ANTHROPIC_API_KEY),)
 
+S3_BUCKET ?= $(BUCKET)
+
 # Python interpreter for the vision phase (runs on host, not in Docker)
 PYTHON ?= python3
 
@@ -105,6 +107,7 @@ ui: $(DB_DIR)
 	docker run --rm -it -p 8501:8501 \
 		$(OLLAMA_FLAGS) \
 		$(CLAUDE_FLAGS) \
+		-e S3_BUCKET=$(S3_BUCKET) \
 		-v "$(DB_DIR):/data" \
 		--entrypoint streamlit $(IMAGE) \
 		run /app/app.py \
@@ -119,6 +122,7 @@ ui-local: $(DB_DIR)
 	OLLAMA_HOST=$(OLLAMA_HOST) \
 	OLLAMA_SQL_MODEL=$(OLLAMA_SQL_MODEL) \
 	CLAUDE_SQL_MODEL=$(CLAUDE_SQL_MODEL) \
+	S3_BUCKET=$(S3_BUCKET) \
 	$(if $(ANTHROPIC_API_KEY),ANTHROPIC_API_KEY=$(ANTHROPIC_API_KEY),) \
 	streamlit run app.py
 

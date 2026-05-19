@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -219,7 +220,7 @@ def presign(s3_client, bucket: str, key: str) -> str:
 
 def run_ffprobe(url: str) -> dict:
     cmd = [
-        "ffprobe", "-v", "quiet",
+        "ffprobe", "-v", "error",
         "-print_format", "json",
         "-show_streams", "-show_format",
         url,
@@ -389,15 +390,26 @@ _EMPTY_META: dict = {
 }
 
 
+_MAX_PROBE_RETRIES = 3
+
+
 def probe_one(s3_client, bucket: str, key: str) -> tuple[str, dict]:
-    try:
-        url = presign(s3_client, bucket, key)
-        ffprobe_data = run_ffprobe(url)
-        mediainfo_tracks = run_mediainfo(url) if MEDIAINFO_AVAILABLE else None
-        meta = parse_ffprobe(ffprobe_data, mediainfo_tracks)
-    except Exception as exc:
-        meta = dict(_EMPTY_META)
-        meta["error"] = str(exc)[:500]
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_PROBE_RETRIES):
+        try:
+            url = presign(s3_client, bucket, key)
+            ffprobe_data = run_ffprobe(url)
+            mediainfo_tracks = run_mediainfo(url) if MEDIAINFO_AVAILABLE else None
+            return key, parse_ffprobe(ffprobe_data, mediainfo_tracks)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _MAX_PROBE_RETRIES - 1:
+                delay = 2 ** attempt  # 1s, 2s
+                log.warning("probe attempt %d/%d failed for %s (%s) — retrying in %ds",
+                            attempt + 1, _MAX_PROBE_RETRIES, key, exc, delay)
+                time.sleep(delay)
+    meta = dict(_EMPTY_META)
+    meta["error"] = str(last_exc)[:500]
     return key, meta
 
 
@@ -500,9 +512,10 @@ HASH_MATCH_THRESHOLD = 10  # max dHash bit distance (out of 64) to consider file
 
 _VISION_PROMPT = """\
 Describe what you see in these video frames. Include: what is happening, \
-whether there is any text or credits visible, how bright or dark the image is, \
-and what kind of content this appears to be (e.g. movie, TV show, sports, documentary, \
-animation, commercial). Be concise and factual."""
+whether opening or closing title credit sequences are visible (NOT regular subtitles, \
+watermarks, scoreboards, or on-screen text — only dedicated credit rolls/sequences), \
+how bright or dark the image is, and what kind of content this appears to be \
+(e.g. movie, TV show, sports, documentary, animation, commercial). Be concise and factual."""
 
 _STRUCTURE_PROMPT = """\
 Given this description of video frames, respond with ONLY a JSON object — no markdown.
@@ -518,6 +531,9 @@ Filename: {filename}
   "genre_tags": ["tag1", "tag2"]
 }}
 
+has_credits must be true ONLY if the description explicitly mentions opening or closing \
+title credit sequences (scrolling names, cast/crew lists). Watermarks, subtitles, \
+scoreboards, or any other on-screen text do NOT count — set false for those.
 For genre_tags pick 1-5 from: action, drama, comedy, documentary, sports, news, \
 animation, nature, music, commercial, trailer, educational, gaming, film."""
 
@@ -533,6 +549,9 @@ Filename: {filename}
   "genre_tags": ["tag1", "tag2"]
 }}
 
+has_credits must be true ONLY if opening or closing title credit sequences are visible \
+(scrolling names, cast/crew lists). Watermarks, subtitles, scoreboards, or any other \
+on-screen text do NOT count — set false for those.
 For genre_tags pick 1-5 from: action, drama, comedy, documentary, sports, news, \
 animation, nature, music, commercial, trailer, educational, gaming, film."""
 

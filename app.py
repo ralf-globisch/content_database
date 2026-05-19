@@ -9,6 +9,7 @@ OLLAMA_HOST       = os.environ.get("OLLAMA_HOST",       "http://localhost:11434"
 SQL_MODEL         = os.environ.get("OLLAMA_SQL_MODEL",  "llama3.2")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 CLAUDE_SQL_MODEL  = os.environ.get("CLAUDE_SQL_MODEL",  "claude-haiku-4-5-20251001")
+S3_BUCKET         = os.environ.get("S3_BUCKET",         "bitmovin-api-eu-west1-ci-input")
 PAGE_SIZE         = 200
 
 try:
@@ -39,16 +40,17 @@ Database tables:
     audio_codec TEXT, audio_channels INT, audio_sample_rate INT,
     dolby_atmos BOOL, dolby_codec_family TEXT, error TEXT)
 
-  audio_tracks(s3_key, track_index INT, codec TEXT, channels INT, sample_rate INT,
-    language TEXT  -- ISO code e.g. 'eng', dolby_atmos BOOL, dolby_codec_family TEXT)
+  audio_tracks(s3_key TEXT, track_index INT, codec TEXT, channels INT,
+    sample_rate INT, language TEXT, dolby_atmos BOOL, dolby_codec_family TEXT)
+    -- language is ISO code e.g. 'eng', 'fra'. No analyzed_at column here.
 
-  content_vision(s3_key PK, description TEXT,
-    style TEXT,      -- 'live_action', 'animated', 'cgi', 'mixed'
-    has_credits BOOL, -- true if ending/opening credits were detected
-    brightness TEXT,  -- 'bright', 'normal', 'dark', 'mixed'
-    genre_tags VARCHAR[],  -- e.g. ['drama', 'action']  use list_contains(genre_tags, 'sports') to search
-    analyzed_at TEXT,
-    source_key TEXT)  -- non-NULL means this row is a copy; source_key points to the analysed representative
+  content_vision(s3_key TEXT PK, description TEXT,
+    style TEXT,       -- one of: 'live_action', 'animated', 'cgi', 'mixed'
+    has_credits BOOL, -- true if ending/opening credits detected
+    brightness TEXT,  -- one of: 'bright', 'normal', 'dark', 'mixed'
+    genre_tags VARCHAR[], -- array, e.g. ['drama','sports']. ONLY content_vision has this.
+    analyzed_at TEXT, -- ONLY in content_vision, not in any other table
+    source_key TEXT)  -- non-NULL = copy of another row; join to the representative
 
 When aliasing, always write the full table name followed by the alias, e.g.:
   media_files mf, media_metadata mm, audio_tracks atr, content_vision cv
@@ -56,9 +58,32 @@ Never use an alias alone in the FROM clause — always write the full table name
 
 Rules:
 - Return ONLY the SQL statement, no explanation, no markdown fences.
-- Use DuckDB syntax. For array columns use list_contains(genre_tags, 'sports').
-- JOIN tables via s3_key when needed.
-- NEVER use 'at' as a table alias — it is a reserved keyword in DuckDB."""
+- Use DuckDB syntax.
+- JOIN tables via s3_key when needed. Only JOIN tables actually needed for the query.
+- To search genre_tags use: list_contains(cv.genre_tags, 'sports')
+- NEVER use 'at' as a table alias — it is a reserved keyword in DuckDB.
+- Always write alias.* with a dot, never alias* (e.g. cv.* not cv*).
+- Always qualify every column reference with its table alias, including inside subqueries.
+
+Example — content with more than one audio track:
+SELECT f.s3_key,
+  count(atr.track_index)  AS audio_tracks,
+  string_agg(coalesce(atr.language,'?') || ':' || coalesce(atr.codec,'?') || '/' || coalesce(atr.channels::TEXT,'?') || 'ch', '  ' ORDER BY atr.track_index) AS tracks_detail,
+  bool_or(atr.dolby_atmos) AS has_atmos,
+  round(f.size_bytes / 1e6, 1) AS size_mb
+FROM media_files f
+JOIN audio_tracks atr USING (s3_key)
+GROUP BY f.s3_key, f.size_bytes
+HAVING count(atr.track_index) > 1
+ORDER BY audio_tracks DESC
+- NEVER JOIN audio_tracks unless the question is about audio tracks or languages.
+- When joining audio_tracks, always GROUP BY and use string_agg to show track details.
+- analyzed_at exists ONLY in content_vision — never reference it from other tables.
+
+Example — find sports content:
+SELECT cv.s3_key, cv.description, cv.style, cv.genre_tags
+FROM content_vision cv
+WHERE list_contains(cv.genre_tags, 'sports')"""
 
 
 def _generate_sql(nl_query: str) -> str:
@@ -104,6 +129,16 @@ def _clean_sql(sql: str) -> str:
     return sql.strip()
 
 
+def _run_sql(sql: str) -> None:
+    try:
+        get_conn().execute(f"EXPLAIN {sql}")
+        st.session_state["df"] = get_conn().execute(sql).df()
+        st.session_state["page"] = 1
+    except Exception as e:
+        st.session_state.pop("df", None)
+        st.error(f"Query error: {e}")
+
+
 @st.cache_resource
 def get_conn():
     return duckdb.connect(DB_PATH, read_only=True)
@@ -138,7 +173,7 @@ except Exception:
 with open(QUERIES_PATH) as f:
     saved = yaml.safe_load(f)
 
-# --- Natural language search ---
+# --- Natural language search (primary interface) ---
 if HAS_NL:
     _backend_label = (
         f"Claude · model: `{CLAUDE_SQL_MODEL}`"
@@ -146,7 +181,7 @@ if HAS_NL:
         else f"Ollama · model: `{SQL_MODEL}` · host: `{OLLAMA_HOST}`"
     )
     _spinner_label = CLAUDE_SQL_MODEL if HAS_CLAUDE else SQL_MODEL
-    with st.expander("Natural Language Search", expanded=True):
+    with st.expander("Search", expanded=True):
         st.caption(f"Powered by {_backend_label}")
         nl_col, btn_col = st.columns([5, 1])
         nl_query = nl_col.text_input(
@@ -155,50 +190,42 @@ if HAS_NL:
             label_visibility="collapsed",
             key="nl_input",
         )
-        if btn_col.button("Generate SQL", use_container_width=True) and nl_query.strip():
+        if btn_col.button("Search", type="primary", use_container_width=True) and nl_query.strip():
             with st.spinner(f"Asking {_spinner_label}..."):
                 try:
                     generated = _generate_sql(nl_query.strip())
                     st.session_state["sql_area"] = generated
-                    st.session_state["_nl_generated"] = True
-                    st.session_state["page"] = 1
+                    _run_sql(generated)
                 except Exception as e:
-                    st.error(f"SQL generation failed: {e}")
-            st.rerun()
+                    st.error(f"Search failed: {e}")
     st.write("")
 
-# --- Saved queries dropdown ---
-choice = st.selectbox(
-    "Saved query",
-    ["— ad hoc —"] + list(saved.keys()),
-    format_func=lambda k: k if k == "— ad hoc —" else saved[k]["label"],
-    key="query_choice",
-)
-
-if st.session_state.get("last_choice") != choice:
-    if not st.session_state.pop("_nl_generated", False):
-        st.session_state["sql_area"] = (
-            "SELECT * FROM media_files LIMIT 20"
-            if choice == "— ad hoc —"
-            else saved[choice]["sql"]
-        )
-    st.session_state["last_choice"] = choice
-    st.session_state["page"] = 1
-
+# --- Advanced: saved queries + SQL editor ---
 if "sql_area" not in st.session_state:
     st.session_state["sql_area"] = "SELECT * FROM media_files LIMIT 20"
 
-sql = st.text_area("SQL", height=140, key="sql_area")
-
-if st.button("Run", type="primary"):
+def _on_query_choice_change():
+    key = st.session_state["query_choice"]
+    st.session_state["sql_area"] = (
+        "SELECT * FROM media_files LIMIT 20"
+        if key == "— ad hoc —"
+        else saved[key]["sql"]
+    )
     st.session_state["page"] = 1
-    try:
-        get_conn().execute(f"EXPLAIN {sql}")
-        st.session_state["df"] = get_conn().execute(sql).df()
-    except Exception as e:
-        st.session_state.pop("df", None)
-        st.error(f"Query error: {e}")
 
+with st.expander("Advanced — view / edit SQL", expanded=not HAS_NL):
+    st.selectbox(
+        "Saved query",
+        ["— ad hoc —"] + list(saved.keys()),
+        format_func=lambda k: k if k == "— ad hoc —" else saved[k]["label"],
+        key="query_choice",
+        on_change=_on_query_choice_change,
+    )
+    sql = st.text_area("SQL", height=140, key="sql_area")
+    if st.button("Run", type="primary"):
+        _run_sql(sql)
+
+# --- Results ---
 if "df" in st.session_state:
     df = st.session_state["df"]
     total = len(df)
@@ -224,5 +251,20 @@ if "df" in st.session_state:
         st.caption(f"{total:,} rows")
 
     start = (page - 1) * PAGE_SIZE
-    st.dataframe(df.iloc[start : start + PAGE_SIZE], use_container_width=True)
+    page_df = df.iloc[start : start + PAGE_SIZE]
+    event = st.dataframe(
+        page_df,
+        use_container_width=True,
+        on_select="rerun",
+        selection_mode="multi-row",
+    )
     st.download_button("Download CSV", df.to_csv(index=False), "results.csv", "text/csv")
+
+    selected_rows = event.selection.rows
+    if selected_rows and "s3_key" in page_df.columns:
+        cmds = "\n".join(
+            f"aws s3 cp s3://{S3_BUCKET}/{page_df.iloc[i]['s3_key']} ."
+            for i in selected_rows
+        )
+        st.caption(f"{len(selected_rows)} file(s) selected — click the copy icon to copy the command(s):")
+        st.code(cmds, language="bash")
