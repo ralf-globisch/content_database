@@ -1,4 +1,4 @@
-# S3 Media Content Cataloguer
+# BitQuery (S3 Media Content Cataloguer)
 
 Inventories video and audio files in an S3 bucket, extracts technical metadata via `ffprobe` (using presigned URLs — no full file downloads), and stores everything in a local [DuckDB](https://duckdb.org/) database for ad-hoc querying.
 
