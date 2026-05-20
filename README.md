@@ -21,6 +21,14 @@ Inventories video and audio files in an S3 bucket, extracts technical metadata v
 - AWS credentials with `s3:ListBucket` and `s3:GetObject` on the target bucket
 - [DuckDB CLI](https://duckdb.org/docs/installation/) for querying results locally (optional)
 
+**Phase 3 (vision) additional requirements** — runs on the host, not in Docker:
+
+```bash
+pip install -r requirements.txt   # anthropic, ollama, boto3, duckdb, imagehash, …
+```
+
+And either an `ANTHROPIC_API_KEY` **or** a running [Ollama](https://ollama.com) instance.
+
 ## Quick start
 
 ```bash
@@ -53,7 +61,7 @@ Results are written to `./data/content_catalogue.duckdb`.
 
 ## Phased workflow
 
-The two phases are independent and idempotent — Phase 2 skips files already probed, so you can safely interrupt and resume.
+All three phases are independent and idempotent — each skips work already done, so you can safely interrupt and resume. Phase 3 (vision) is optional and runs after Phase 2.
 
 ### Phase 1 — Inventory
 
@@ -150,7 +158,9 @@ The vision phase uses the `python3` on your `PATH`. To use a virtualenv:
 PYTHON=/path/to/venv/bin/python make vision
 ```
 
-### Run both phases together
+### Run both phases together (Phase 1 + 2 only)
+
+`make both` runs inventory then metadata in one command. It does **not** include Phase 3 (vision).
 
 ```bash
 make both
@@ -245,6 +255,24 @@ SELECT s3_key, round(size_bytes/1e9, 1) AS size_gb, extension, media_type
 FROM media_files
 WHERE size_bytes > 10e9
 ORDER BY size_bytes DESC;
+
+-- Content vision: browse AI-generated descriptions
+SELECT s3_key, style, brightness, genre_tags, description
+FROM content_vision
+ORDER BY analyzed_at DESC;
+
+-- Filter by genre tag (e.g. all sports clips)
+SELECT cv.s3_key, cv.description, m.duration_s
+FROM content_vision cv
+JOIN media_metadata m USING (s3_key)
+WHERE list_contains(cv.genre_tags, 'sports');
+
+-- Files with opening/closing credits detected
+SELECT s3_key, description FROM content_vision WHERE has_credits = true;
+
+-- Genre tag distribution
+SELECT UNNEST(genre_tags) AS genre, count(*) AS files
+FROM content_vision GROUP BY genre ORDER BY files DESC;
 ```
 
 ## Database schema
@@ -257,6 +285,20 @@ content_vision     — one row per analysed video (AI-generated description, gen
 ```
 
 `content_vision.source_key` links duplicate files back to the representative that was actually analysed.
+
+## BitQuery web UI
+
+A Streamlit dashboard for exploring the database visually — charts for resolution, HDR format, audio codecs, genre distribution, and a natural-language query interface powered by Claude or Ollama.
+
+```bash
+# Run inside Docker (recommended)
+make ui          # → http://localhost:8501
+
+# Run directly on the host (easier when Ollama is local)
+make ui-local    # → http://localhost:8501
+```
+
+Natural-language search requires either `ANTHROPIC_API_KEY` set in your environment, or Ollama running locally with the `llama3.2` model pulled.
 
 ## Docker without Make
 
