@@ -40,7 +40,10 @@ DOCKER_RUN := docker run --rm \
 	-v "$(DB_DIR):/data" \
 	$(IMAGE)
 
-.PHONY: build inventory metadata vision both summary query shell ui ui-local help check-auth
+.PHONY: build init inventory metadata vision both summary query shell ui ui-local help check-auth \
+        ignore-prefix unignore-prefix list-prefixes force-rescan unknown-extensions \
+        ec2-setup ec2-deploy cloud-init cloud-inventory cloud-metadata cloud-run \
+        db-pull db-push ec2-stop ec2-terminate
 
 check-auth:
 	@aws sts get-caller-identity > /dev/null || \
@@ -55,7 +58,15 @@ check-auth:
 build:
 	docker build -t $(IMAGE) .
 
-## Phase 1 — list all video and audio files in the bucket
+## Interactive bucket setup wizard — lists all top-level prefixes and asks what to scan
+## Usage: make init  (uses BUCKET variable, runs on host so stdin/stdout work)
+init: check-auth $(DB_DIR)
+	DB_PATH=$(CURDIR)/data/content_catalogue.duckdb \
+	$(or $(AWS_PROFILE:%=AWS_PROFILE=%),) \
+	$(PYTHON) catalogue.py --phase init --bucket $(BUCKET) --db $(CURDIR)/data/content_catalogue.duckdb $(PROFILE_ARG) $(ARGS)
+
+## Phase 1 — list video and audio files (incremental: skips recently-scanned prefixes)
+## Use ARGS="--staleness-days 0" to force a full rescan, or ARGS="--no-skip-stale"
 inventory: check-auth $(DB_DIR)
 	$(DOCKER_RUN) --phase inventory --bucket $(BUCKET) --db $(DB_FILE) $(PROFILE_ARG) $(ARGS)
 
@@ -126,22 +137,151 @@ ui-local: $(DB_DIR)
 	$(if $(ANTHROPIC_API_KEY),ANTHROPIC_API_KEY=$(ANTHROPIC_API_KEY),) \
 	streamlit run app.py
 
+## Add a prefix to the ignore list (persists across scans)
+## Usage: make ignore-prefix PREFIX=shows/
+ignore-prefix: $(DB_DIR)
+ifndef PREFIX
+	$(error Usage: make ignore-prefix PREFIX=<prefix>)
+endif
+	$(PYTHON) catalogue.py --db $(CURDIR)/data/content_catalogue.duckdb --bucket $(BUCKET) --ignore-prefix $(PREFIX)
+
+## Remove a prefix from the ignore list
+## Usage: make unignore-prefix PREFIX=shows/
+unignore-prefix: $(DB_DIR)
+ifndef PREFIX
+	$(error Usage: make unignore-prefix PREFIX=<prefix>)
+endif
+	$(PYTHON) catalogue.py --db $(CURDIR)/data/content_catalogue.duckdb --bucket $(BUCKET) --unignore-prefix $(PREFIX)
+
+## Show all known prefixes with scan status
+list-prefixes: $(DB_DIR)
+	$(PYTHON) catalogue.py --db $(CURDIR)/data/content_catalogue.duckdb --bucket $(BUCKET) --list-prefixes
+
+## Force a rescan of a specific prefix regardless of staleness
+## Usage: make force-rescan PREFIX=shows/
+force-rescan: check-auth $(DB_DIR)
+ifndef PREFIX
+	$(error Usage: make force-rescan PREFIX=<prefix>)
+endif
+	$(DOCKER_RUN) --phase inventory --bucket $(BUCKET) --db $(DB_FILE) $(PROFILE_ARG) --force-prefix $(PREFIX) $(ARGS)
+
+## Show file extensions found during scanning that are not video or audio
+unknown-extensions: $(DB_DIR)
+	$(PYTHON) catalogue.py --db $(CURDIR)/data/content_catalogue.duckdb --bucket $(BUCKET) --list-prefixes 2>/dev/null || true
+	@echo ""
+	docker run --rm -v "$(DB_DIR):/data" --entrypoint python $(IMAGE) \
+		-c "import duckdb,sys; df=duckdb.connect(sys.argv[1],read_only=True).execute('SELECT * FROM scan_unknown_extensions ORDER BY count DESC').df(); print(df.to_string(index=False) if not df.empty else 'No unknown extensions found.')" \
+		$(DB_FILE)
+
+# ---------------------------------------------------------------------------
+# Cloud (EC2) targets — run the pipeline on a remote EC2 instance in eu-west-1
+# ---------------------------------------------------------------------------
+# Usage: EC2_HOST=ubuntu@1.2.3.4 make <target>
+# The remote instance must have Docker installed and /data on an EBS volume.
+# Run  make ec2-setup  first to bootstrap a fresh instance.
+EC2_HOST     ?= $(error EC2_HOST is not set — use: EC2_HOST=ubuntu@<ip> make <target>)
+EC2_REPO_DIR ?= /opt/content-database
+EC2_DB_FILE  ?= /data/content_catalogue.duckdb
+
+## Bootstrap a fresh EC2 instance (run once after launch)
+ec2-setup:
+	scp scripts/ec2-setup.sh $(EC2_HOST):/tmp/ec2-setup.sh
+	ssh $(EC2_HOST) "bash /tmp/ec2-setup.sh"
+
+## Deploy/update the source code to EC2
+ec2-deploy:
+	ssh $(EC2_HOST) "mkdir -p $(EC2_REPO_DIR)"
+	rsync -az --exclude '.git' --exclude 'data/' \
+		$(CURDIR)/ $(EC2_HOST):$(EC2_REPO_DIR)/
+
+## Run the interactive init wizard on EC2 (allocates a TTY)
+## Usage: EC2_HOST=ubuntu@<ip> make cloud-init
+cloud-init: ec2-deploy
+	ssh -t $(EC2_HOST) "cd $(EC2_REPO_DIR) && make init BUCKET=$(BUCKET) $(if $(AWS_PROFILE),AWS_PROFILE=$(AWS_PROFILE),)"
+
+## Run inventory phase on EC2 (incremental — respects staleness)
+## Usage: EC2_HOST=ubuntu@<ip> make cloud-inventory [ARGS="--staleness-days 0"]
+cloud-inventory: ec2-deploy
+	ssh $(EC2_HOST) "cd $(EC2_REPO_DIR) && make inventory BUCKET=$(BUCKET) ARGS='$(ARGS)' $(if $(AWS_PROFILE),AWS_PROFILE=$(AWS_PROFILE),)"
+
+## Run metadata (ffprobe) phase on EC2
+## Usage: EC2_HOST=ubuntu@<ip> make cloud-metadata [ARGS="--workers 40"]
+cloud-metadata: ec2-deploy
+	ssh $(EC2_HOST) "cd $(EC2_REPO_DIR) && make metadata BUCKET=$(BUCKET) ARGS='$(ARGS)' $(if $(AWS_PROFILE),AWS_PROFILE=$(AWS_PROFILE),)"
+
+## Run inventory + metadata on EC2 (full pipeline, no vision)
+## Usage: EC2_HOST=ubuntu@<ip> make cloud-run [ARGS="..."]
+cloud-run: ec2-deploy
+	ssh $(EC2_HOST) "cd $(EC2_REPO_DIR) && make both BUCKET=$(BUCKET) ARGS='$(ARGS)' $(if $(AWS_PROFILE),AWS_PROFILE=$(AWS_PROFILE),)"
+
+## Sync the DuckDB file from EC2 to local data/ directory
+## Usage: EC2_HOST=ubuntu@<ip> make db-pull
+db-pull: $(DB_DIR)
+	scp $(EC2_HOST):$(EC2_DB_FILE) $(DB_DIR)/content_catalogue.duckdb
+	@echo "Database pulled to $(DB_DIR)/content_catalogue.duckdb"
+
+## Push the local DuckDB file to EC2 (e.g. to seed a fresh instance)
+## Usage: EC2_HOST=ubuntu@<ip> make db-push
+db-push:
+	scp $(DB_DIR)/content_catalogue.duckdb $(EC2_HOST):$(EC2_DB_FILE)
+	@echo "Database pushed to $(EC2_HOST):$(EC2_DB_FILE)"
+
+## Stop the EC2 instance (EBS volume persists; instance can be restarted later)
+## Always run  make db-pull  first to save the database locally.
+## Usage: EC2_INSTANCE_ID=i-0abc123 make ec2-stop
+ec2-stop:
+ifndef EC2_INSTANCE_ID
+	$(error EC2_INSTANCE_ID is not set — find it in the AWS console or: aws ec2 describe-instances --filters "Name=ip-address,Values=<ip>")
+endif
+	@echo "Pulling database before stopping instance..."
+	$(MAKE) db-pull
+	aws ec2 stop-instances --instance-ids $(EC2_INSTANCE_ID)
+	@echo "Instance $(EC2_INSTANCE_ID) is stopping. EBS volume is preserved."
+	@echo "Restart later with: aws ec2 start-instances --instance-ids $(EC2_INSTANCE_ID)"
+
+## Terminate the EC2 instance permanently (destroys instance; EBS deleted unless configured otherwise)
+## Always run  make db-pull  first. This cannot be undone.
+## Usage: EC2_INSTANCE_ID=i-0abc123 make ec2-terminate
+ec2-terminate:
+ifndef EC2_INSTANCE_ID
+	$(error EC2_INSTANCE_ID is not set — find it in the AWS console or: aws ec2 describe-instances --filters "Name=ip-address,Values=<ip>")
+endif
+	@echo "WARNING: This permanently terminates $(EC2_INSTANCE_ID)."
+	@echo "Pulling database first..."
+	$(MAKE) db-pull
+	aws ec2 terminate-instances --instance-ids $(EC2_INSTANCE_ID)
+	@echo "Instance $(EC2_INSTANCE_ID) terminated."
+
 $(DB_DIR):
 	mkdir -p $(DB_DIR)
 
 help:
 	@echo ""
 	@echo "Usage:"
-	@echo "  make build                          Build the Docker image"
-	@echo "  make inventory  [ARGS=...]           Phase 1: list all media files"
-	@echo "  make metadata   [ARGS=...]           Phase 2: extract attributes via ffprobe"
-	@echo "  make vision     [ARGS=...]           Phase 3: analyse frames with Ollama llava"
-	@echo "  make both       [ARGS=...]           Run Phase 1 + 2"
-	@echo "  make summary                        Print collected stats"
-	@echo "  make query Q=\"<sql>\"                 Run a SQL query on the DB"
-	@echo "  make shell                          Open interactive DuckDB shell"
-	@echo "  make ui                             Open Streamlit query UI in Docker (http://localhost:8501)"
-	@echo "  make ui-local                       Open Streamlit query UI on host (avoids Docker networking)"
+	@echo "  make build                              Build the Docker image"
+	@echo "  make init       [BUCKET=...]            Interactive setup: pick which prefixes to scan/ignore"
+	@echo "  make inventory  [ARGS=...]              Phase 1: list media files (incremental)"
+	@echo "  make metadata   [ARGS=...]              Phase 2: extract attributes via ffprobe"
+	@echo "  make vision     [ARGS=...]              Phase 3: analyse frames with Ollama / Claude"
+	@echo "  make both       [ARGS=...]              Run Phase 1 + 2"
+	@echo "  make summary                            Print collected stats"
+	@echo "  make query Q=\"<sql>\"                    Run a SQL query on the DB"
+	@echo "  make shell                              Open interactive DuckDB shell"
+	@echo "  make ui                                 Open Streamlit query UI in Docker (http://localhost:8501)"
+	@echo "  make ui-local                           Open Streamlit query UI on host"
+	@echo ""
+	@echo "Prefix management:"
+	@echo "  make list-prefixes  [BUCKET=...]        Show all known prefixes with scan status"
+	@echo "  make ignore-prefix  PREFIX=<p> [BUCKET=...]  Add prefix to ignore list"
+	@echo "  make unignore-prefix PREFIX=<p> [BUCKET=...]  Remove prefix from ignore list"
+	@echo "  make force-rescan   PREFIX=<p> [BUCKET=...]  Force rescan of one prefix"
+	@echo "  make unknown-extensions [BUCKET=...]    Show file extensions not recognised as video/audio"
+	@echo ""
+	@echo "Incremental scan ARGS:"
+	@echo "  ARGS=\"--staleness-days 30\"              Skip prefixes scanned within 30 days (default 7)"
+	@echo "  ARGS=\"--staleness-days 0\"               Rescan everything (force full scan)"
+	@echo "  ARGS=\"--no-skip-stale\"                  Scan all non-ignored prefixes"
+	@echo "  ARGS=\"--force-prefix shows/\"            Force rescan of one prefix"
 	@echo ""
 	@echo "AWS credentials (pick one):"
 	@echo "  export AWS_PROFILE=my-profile"
@@ -155,6 +295,17 @@ help:
 	@echo "  Override Ollama model: OLLAMA_VISION_MODEL=llava make vision  (GPU hosts)"
 	@echo "  Override Claude model: CLAUDE_VISION_MODEL=claude-sonnet-4-6 make vision"
 	@echo "  Override python:       PYTHON=/path/to/venv/bin/python make vision"
+	@echo ""
+	@echo "Cloud (EC2 eu-west-1) — free S3 transfer, 2-4x faster:"
+	@echo "  EC2_HOST=ubuntu@<ip> make ec2-setup        Bootstrap a fresh EC2 instance"
+	@echo "  EC2_HOST=ubuntu@<ip> make cloud-init        Interactive init wizard on EC2"
+	@echo "  EC2_HOST=ubuntu@<ip> make cloud-run         Run inventory + metadata on EC2"
+	@echo "  EC2_HOST=ubuntu@<ip> make cloud-inventory   Incremental inventory on EC2"
+	@echo "  EC2_HOST=ubuntu@<ip> make db-pull           Sync DB from EC2 to local"
+	@echo "  EC2_HOST=ubuntu@<ip> make db-push           Seed EC2 with local DB"
+	@echo "  EC2_INSTANCE_ID=i-0abc make ec2-stop        Stop instance (DB pulled first, EBS kept)"
+	@echo "  EC2_INSTANCE_ID=i-0abc make ec2-terminate   Terminate permanently (DB pulled first)"
+	@echo "  See scripts/ec2-setup.sh for IAM role and EBS configuration."
 	@echo ""
 	@echo "Optional ARGS examples:"
 	@echo "  ARGS=\"--prefix analysis/jan-ozer-per-title-files/\"   scope to a prefix"

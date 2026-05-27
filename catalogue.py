@@ -62,7 +62,8 @@ def init_db(db_path: str) -> duckdb.DuckDBPyConnection:
             last_modified TEXT,
             extension     TEXT,
             top_prefix    TEXT,
-            media_type    TEXT
+            media_type    TEXT,
+            bucket        TEXT DEFAULT ''
         )
     """)
     con.execute("""
@@ -116,6 +117,41 @@ def init_db(db_path: str) -> duckdb.DuckDBPyConnection:
             source_key  TEXT  -- NULL = directly analysed; set = copied from this key
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS scan_buckets (
+            bucket           TEXT PRIMARY KEY,
+            first_indexed_at TEXT,
+            last_indexed_at  TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS scan_prefixes (
+            bucket             TEXT NOT NULL,
+            prefix             TEXT NOT NULL,
+            ignored            BOOLEAN DEFAULT FALSE,
+            force_rescan       BOOLEAN DEFAULT FALSE,
+            last_scanned_at    TEXT,
+            latest_s3_modified TEXT,
+            file_count         INTEGER DEFAULT 0,
+            PRIMARY KEY (bucket, prefix)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS scan_unknown_extensions (
+            bucket      TEXT NOT NULL,
+            extension   TEXT NOT NULL,
+            example_key TEXT,
+            first_seen_at TEXT,
+            count       INTEGER DEFAULT 1,
+            PRIMARY KEY (bucket, extension)
+        )
+    """)
+    # migrate existing databases: add bucket column to older tables
+    for table in ("media_files", "media_metadata", "audio_tracks"):
+        try:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN bucket TEXT DEFAULT ''")
+        except Exception:
+            pass
     # migrate existing databases that predate source_key
     try:
         con.execute("ALTER TABLE content_vision ADD COLUMN source_key TEXT")
@@ -128,14 +164,17 @@ def init_db(db_path: str) -> duckdb.DuckDBPyConnection:
 # Phase 1 — inventory
 # ---------------------------------------------------------------------------
 
-def list_media_files(bucket: str, prefix: str, profile: str | None) -> list[dict]:
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
-    s3 = session.client("s3")
-    paginator = s3.get_paginator("list_objects_v2")
+def _list_prefix_objects(
+    s3_client, bucket: str, prefix: str
+) -> tuple[list[dict], dict[str, dict]]:
+    """List all objects under prefix, returning (media_list, unknown_ext_map).
 
-    media = []
+    unknown_ext_map maps extension → {example_key, count}.
+    """
+    paginator = s3_client.get_paginator("list_objects_v2")
+    media: list[dict] = []
+    unknowns: dict[str, dict] = {}
     total = 0
-    log.info("Listing objects in s3://%s/%s ...", bucket, prefix)
 
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
@@ -147,6 +186,11 @@ def list_media_files(bucket: str, prefix: str, profile: str | None) -> list[dict
             elif ext in AUDIO_EXTENSIONS:
                 media_type = "audio"
             else:
+                if ext:
+                    if ext in unknowns:
+                        unknowns[ext]["count"] += 1
+                    else:
+                        unknowns[ext] = {"example_key": key, "count": 1}
                 continue
             top_prefix = key.split("/")[0] if "/" in key else ""
             media.append({
@@ -161,26 +205,263 @@ def list_media_files(bucket: str, prefix: str, profile: str | None) -> list[dict
     video_count = sum(1 for m in media if m["media_type"] == "video")
     audio_count = sum(1 for m in media if m["media_type"] == "audio")
     log.info(
-        "Scanned %d objects — found %d video, %d audio files.",
-        total, video_count, audio_count,
+        "s3://%s/%s — scanned %d objects, found %d video, %d audio, %d unknown-ext.",
+        bucket, prefix, total, video_count, audio_count, len(unknowns),
     )
+    return media, unknowns
+
+
+def list_media_files(bucket: str, prefix: str, profile: str | None) -> list[dict]:
+    """Backward-compatible wrapper used by the legacy --phase both/inventory path."""
+    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    s3 = session.client("s3")
+    media, _ = _list_prefix_objects(s3, bucket, prefix)
     return media
 
 
-def save_inventory(con: duckdb.DuckDBPyConnection, media: list[dict]) -> None:
+def save_inventory(
+    con: duckdb.DuckDBPyConnection, media: list[dict], bucket: str = ""
+) -> None:
     if not media:
         return
     con.executemany(
         """
         INSERT OR REPLACE INTO media_files
-            (s3_key, size_bytes, last_modified, extension, top_prefix, media_type)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (s3_key, size_bytes, last_modified, extension, top_prefix, media_type, bucket)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         [(m["s3_key"], m["size_bytes"], m["last_modified"],
-          m["extension"], m["top_prefix"], m["media_type"])
+          m["extension"], m["top_prefix"], m["media_type"], bucket)
          for m in media],
     )
     log.info("Saved %d media file records to database.", len(media))
+
+
+def _save_unknown_extensions(
+    con: duckdb.DuckDBPyConnection, bucket: str, unknowns: dict[str, dict]
+) -> None:
+    if not unknowns:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    for ext, info in unknowns.items():
+        con.execute("""
+            INSERT INTO scan_unknown_extensions (bucket, extension, example_key, first_seen_at, count)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (bucket, extension) DO UPDATE SET
+                count = scan_unknown_extensions.count + excluded.count
+        """, [bucket, ext, info["example_key"], now, info["count"]])
+
+
+def list_top_level_prefixes(s3_client, bucket: str) -> list[str]:
+    """Return top-level virtual folder prefixes (with trailing /) plus '' for root objects."""
+    prefixes: list[str] = []
+    has_root_objects = False
+    kwargs: dict = {"Bucket": bucket, "Delimiter": "/", "MaxKeys": 1000}
+    while True:
+        resp = s3_client.list_objects_v2(**kwargs)
+        prefixes.extend(p["Prefix"] for p in resp.get("CommonPrefixes", []))
+        if resp.get("Contents"):
+            has_root_objects = True
+        if not resp.get("IsTruncated"):
+            break
+        kwargs["ContinuationToken"] = resp["NextContinuationToken"]
+    if has_root_objects:
+        prefixes.append("")
+    return sorted(prefixes)
+
+
+def _sample_prefix(s3_client, bucket: str, prefix: str) -> tuple[int, str | None]:
+    """Return (approximate object count, latest LastModified ISO string) for a prefix.
+
+    Uses up to 1000 objects as a sample — fast but not exact for large prefixes.
+    """
+    resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1000)
+    objects = resp.get("Contents", [])
+    count = resp.get("KeyCount", len(objects))
+    if resp.get("IsTruncated"):
+        count = f"{count}+"  # type: ignore[assignment]
+    latest = None
+    if objects:
+        latest = max(o["LastModified"] for o in objects).strftime("%Y-%m-%d")
+    return count, latest  # type: ignore[return-value]
+
+
+def should_scan_prefix(
+    bucket: str,
+    prefix: str,
+    con: duckdb.DuckDBPyConnection,
+    staleness_days: int,
+    force_set: set[str],
+) -> bool:
+    if prefix in force_set:
+        return True
+    row = con.execute(
+        "SELECT ignored, force_rescan, last_scanned_at FROM scan_prefixes WHERE bucket=? AND prefix=?",
+        [bucket, prefix],
+    ).fetchone()
+    if row is None:
+        return True
+    ignored, force_rescan, last_scanned_at = row
+    if ignored:
+        return False
+    if force_rescan:
+        return True
+    if last_scanned_at is None:
+        return True
+    last_dt = datetime.fromisoformat(last_scanned_at)
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
+    age_days = (datetime.now(timezone.utc) - last_dt).days
+    return age_days >= staleness_days
+
+
+def _update_prefix_state(
+    con: duckdb.DuckDBPyConnection,
+    bucket: str,
+    prefix: str,
+    media: list[dict],
+    now: str,
+) -> None:
+    latest_s3 = max((m["last_modified"] for m in media), default=None) if media else None
+    con.execute("""
+        INSERT INTO scan_prefixes (bucket, prefix, last_scanned_at, latest_s3_modified, file_count, force_rescan)
+        VALUES (?, ?, ?, ?, ?, FALSE)
+        ON CONFLICT (bucket, prefix) DO UPDATE SET
+            last_scanned_at    = excluded.last_scanned_at,
+            latest_s3_modified = excluded.latest_s3_modified,
+            file_count         = excluded.file_count,
+            force_rescan       = FALSE
+    """, [bucket, prefix, now, latest_s3, len(media)])
+
+
+def _upsert_bucket(con: duckdb.DuckDBPyConnection, bucket: str, now: str) -> None:
+    con.execute("""
+        INSERT INTO scan_buckets (bucket, first_indexed_at, last_indexed_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT (bucket) DO UPDATE SET last_indexed_at = excluded.last_indexed_at
+    """, [bucket, now, now])
+
+
+def run_inventory_phase(
+    con: duckdb.DuckDBPyConnection,
+    bucket: str,
+    prefix: str,
+    profile: str | None,
+    staleness_days: int,
+    force_prefixes: list[str],
+    no_skip_stale: bool,
+) -> None:
+    """Prefix-aware inventory: only scans prefixes that are stale or forced."""
+    s3 = _s3_client(profile)
+    now = datetime.now(timezone.utc).isoformat()
+
+    # If a specific prefix is given, scan exactly that prefix (bypass staleness).
+    if prefix:
+        log.info("Scanning specific prefix s3://%s/%s ...", bucket, prefix)
+        media, unknowns = _list_prefix_objects(s3, bucket, prefix)
+        save_inventory(con, media, bucket)
+        _save_unknown_extensions(con, bucket, unknowns)
+        _update_prefix_state(con, bucket, prefix, media, now)
+        _upsert_bucket(con, bucket, now)
+        return
+
+    all_prefixes = list_top_level_prefixes(s3, bucket)
+    log.info("Found %d top-level prefixes in s3://%s", len(all_prefixes), bucket)
+
+    force_set = set(force_prefixes)
+    to_scan = []
+    skipped = []
+    for p in all_prefixes:
+        if no_skip_stale or should_scan_prefix(bucket, p, con, staleness_days, force_set):
+            to_scan.append(p)
+        else:
+            skipped.append(p)
+
+    if skipped:
+        log.info(
+            "Skipping %d recently-scanned prefix(es) (--staleness-days %d). "
+            "Use --no-skip-stale or --force-prefix to override.",
+            len(skipped), staleness_days,
+        )
+    log.info("Scanning %d prefix(es) ...", len(to_scan))
+
+    for p in to_scan:
+        media, unknowns = _list_prefix_objects(s3, bucket, p)
+        save_inventory(con, media, bucket)
+        _save_unknown_extensions(con, bucket, unknowns)
+        _update_prefix_state(con, bucket, p, media, now)
+
+    _upsert_bucket(con, bucket, now)
+
+
+def run_init_phase(s3_client, bucket: str, con: duckdb.DuckDBPyConnection) -> None:
+    """Interactive wizard: list top-level prefixes and let the user decide what to scan."""
+    import sys
+    if not sys.stdin.isatty():
+        raise SystemExit("ERROR: --phase init requires an interactive terminal (TTY).")
+
+    print(f"\nListing top-level prefixes in s3://{bucket} …\n")
+    all_prefixes = list_top_level_prefixes(s3_client, bucket)
+    if not all_prefixes:
+        print("No top-level prefixes found.")
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    to_scan: list[str] = []
+    ignored: list[str] = []
+
+    for i, prefix in enumerate(all_prefixes, 1):
+        count, latest = _sample_prefix(s3_client, bucket, prefix)
+        label = prefix if prefix else "(root)"
+        latest_str = f", latest: {latest}" if latest else ""
+        print(f"  [{i}/{len(all_prefixes)}] {label}  ({count} objects{latest_str})")
+        while True:
+            choice = input("  Scan now (y), ignore (n), start scanning so far (s), quit (q)? ").strip().lower()
+            if choice in ("y", "n", "s", "q"):
+                break
+            print("  Please enter y, n, s, or q.")
+
+        if choice == "y":
+            print(f"  → queued\n")
+            to_scan.append(prefix)
+        elif choice == "n":
+            print(f"  → added to ignore list\n")
+            ignored.append(prefix)
+        elif choice == "s":
+            print(f"  → starting scan with {len(to_scan)} prefix(es) queued so far\n")
+            break
+        else:  # q
+            print(f"\nQuit. Saving {len(ignored)} ignored prefix(es), no scan started.")
+            for p in ignored:
+                con.execute("""
+                    INSERT INTO scan_prefixes (bucket, prefix, ignored)
+                    VALUES (?, ?, TRUE)
+                    ON CONFLICT (bucket, prefix) DO UPDATE SET ignored = TRUE
+                """, [bucket, p])
+            _upsert_bucket(con, bucket, now)
+            return
+
+    # Save ignored prefixes
+    for p in ignored:
+        con.execute("""
+            INSERT INTO scan_prefixes (bucket, prefix, ignored)
+            VALUES (?, ?, TRUE)
+            ON CONFLICT (bucket, prefix) DO UPDATE SET ignored = TRUE
+        """, [bucket, p])
+
+    if not to_scan:
+        print("No prefixes selected for scanning.")
+        _upsert_bucket(con, bucket, now)
+        return
+
+    print(f"\nSaved ignore list. Starting inventory scan for: {', '.join(p or '(root)' for p in to_scan)} …\n")
+    for p in to_scan:
+        media, unknowns = _list_prefix_objects(s3_client, bucket, p)
+        save_inventory(con, media, bucket)
+        _save_unknown_extensions(con, bucket, unknowns)
+        _update_prefix_state(con, bucket, p, media, now)
+
+    _upsert_bucket(con, bucket, now)
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +739,8 @@ def run_metadata_phase(
     keys = [r[0] for r in con.execute("""
         SELECT s3_key FROM media_files
         WHERE s3_key NOT IN (SELECT s3_key FROM media_metadata)
-    """).fetchall()]
+          AND (bucket = ? OR ? = '')
+    """, [bucket, bucket]).fetchall()]
     if limit:
         keys = keys[:limit]
 
@@ -1095,13 +1377,13 @@ def print_summary(con: duckdb.DuckDBPyConnection) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Catalogue S3 media content")
     parser.add_argument("--bucket", default="bitmovin-api-eu-west1-ci-input")
-    parser.add_argument("--prefix", default="", help="Limit to a specific S3 prefix")
+    parser.add_argument("--prefix", default="", help="Limit inventory to a specific S3 prefix")
     parser.add_argument("--db", default="content_catalogue.duckdb")
     parser.add_argument("--profile", default=None, help="AWS profile name")
     parser.add_argument("--workers", type=int, default=20, help="Parallel ffprobe workers")
     parser.add_argument(
         "--phase",
-        choices=["inventory", "metadata", "vision", "both", "summary"],
+        choices=["init", "inventory", "metadata", "vision", "both", "summary"],
         default="both",
     )
     parser.add_argument("--limit", type=int, default=None,
@@ -1115,16 +1397,78 @@ def main() -> None:
                              "(slower — runs docker ffmpeg per file; omit for large catalogues)")
     parser.add_argument("--vision-workers", type=int, default=1,
                         help="Parallel workers for vision phase (default 1; increase on GPU hosts)")
+    # Incremental scan control
+    parser.add_argument("--staleness-days", type=int, default=7,
+                        help="Skip prefixes scanned within this many days (default 7)")
+    parser.add_argument("--force-prefix", action="append", default=[],
+                        metavar="PREFIX",
+                        help="Force rescan of this prefix regardless of staleness (repeatable)")
+    parser.add_argument("--no-skip-stale", action="store_true",
+                        help="Disable staleness check — scan all non-ignored prefixes")
+    # Prefix management (run and exit)
+    parser.add_argument("--ignore-prefix", metavar="PREFIX",
+                        help="Mark a prefix as ignored in scan_prefixes, then exit")
+    parser.add_argument("--unignore-prefix", metavar="PREFIX",
+                        help="Clear the ignored flag on a prefix, then exit")
+    parser.add_argument("--list-prefixes", action="store_true",
+                        help="Print all known prefixes with scan status, then exit")
     args = parser.parse_args()
 
     con = init_db(args.db)
 
-    if args.phase in ("inventory", "metadata", "vision", "both"):
+    # --- Prefix management commands (no AWS needed) ---
+    if args.ignore_prefix:
+        con.execute("""
+            INSERT INTO scan_prefixes (bucket, prefix, ignored)
+            VALUES (?, ?, TRUE)
+            ON CONFLICT (bucket, prefix) DO UPDATE SET ignored = TRUE
+        """, [args.bucket, args.ignore_prefix])
+        print(f"Marked '{args.ignore_prefix}' as ignored for bucket '{args.bucket}'.")
+        con.close()
+        return
+
+    if args.unignore_prefix:
+        con.execute("""
+            INSERT INTO scan_prefixes (bucket, prefix, ignored)
+            VALUES (?, ?, FALSE)
+            ON CONFLICT (bucket, prefix) DO UPDATE SET ignored = FALSE
+        """, [args.bucket, args.unignore_prefix])
+        print(f"Cleared ignore flag for '{args.unignore_prefix}' in bucket '{args.bucket}'.")
+        con.close()
+        return
+
+    if args.list_prefixes:
+        rows = con.execute("""
+            SELECT prefix,
+                   CASE WHEN ignored THEN 'ignored' ELSE '' END AS status,
+                   last_scanned_at,
+                   latest_s3_modified,
+                   file_count
+            FROM scan_prefixes
+            WHERE bucket = ?
+            ORDER BY prefix
+        """, [args.bucket]).df()
+        if rows.empty:
+            print(f"No prefixes recorded for bucket '{args.bucket}'.")
+        else:
+            print(f"\nPrefixes for s3://{args.bucket}:\n")
+            print(rows.to_string(index=False))
+        con.close()
+        return
+
+    # --- Phases that need AWS ---
+    if args.phase in ("init", "inventory", "metadata", "vision", "both"):
         _check_aws_auth(args.profile)
 
-    if args.phase in ("inventory", "both"):
-        media = list_media_files(args.bucket, args.prefix, args.profile)
-        save_inventory(con, media)
+    if args.phase == "init":
+        s3 = _s3_client(args.profile)
+        run_init_phase(s3, args.bucket, con)
+
+    elif args.phase in ("inventory", "both"):
+        run_inventory_phase(
+            con, args.bucket, args.prefix, args.profile,
+            args.staleness_days, args.force_prefix, args.no_skip_stale,
+        )
 
     if args.phase in ("metadata", "both"):
         run_metadata_phase(con, args.bucket, args.profile, args.workers, args.limit)

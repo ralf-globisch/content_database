@@ -36,8 +36,8 @@ HAS_NL = HAS_CLAUDE or HAS_OLLAMA
 _NL_SCHEMA = """Convert the user's natural language request into a DuckDB SQL SELECT statement.
 
 Database tables:
-  media_files(s3_key PK, size_bytes BIGINT, last_modified TEXT, extension TEXT, top_prefix TEXT, media_type TEXT)
-    media_type is 'video' or 'audio'
+  media_files(s3_key PK, size_bytes BIGINT, last_modified TEXT, extension TEXT, top_prefix TEXT, media_type TEXT, bucket TEXT)
+    media_type is 'video' or 'audio'; bucket is the S3 bucket name
 
   media_metadata(s3_key PK, duration_s DOUBLE, format_name TEXT, width INT, height INT, fps DOUBLE,
     video_codec TEXT, video_bitrate INT [kbps], scan_type TEXT,
@@ -93,29 +93,35 @@ FROM content_vision cv
 WHERE list_contains(cv.genre_tags, 'sports')"""
 
 
-def _generate_sql(nl_query: str) -> str:
+def _generate_sql(nl_query: str, bucket_filter: str = "") -> str:
+    system = _NL_SCHEMA
+    if bucket_filter:
+        system += (
+            f"\n\nActive bucket filter: always append `{bucket_filter}` to WHERE clauses "
+            f"involving media_files or media_metadata."
+        )
     if HAS_CLAUDE:
-        return _generate_sql_claude(nl_query)
-    return _generate_sql_ollama(nl_query)
+        return _generate_sql_claude(nl_query, system)
+    return _generate_sql_ollama(nl_query, system)
 
 
-def _generate_sql_claude(nl_query: str) -> str:
+def _generate_sql_claude(nl_query: str, system: str = _NL_SCHEMA) -> str:
     client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     resp = client.messages.create(
         model=CLAUDE_SQL_MODEL,
         max_tokens=512,
-        system=_NL_SCHEMA,
+        system=system,
         messages=[{"role": "user", "content": nl_query}],
     )
     return _clean_sql(resp.content[0].text)
 
 
-def _generate_sql_ollama(nl_query: str) -> str:
+def _generate_sql_ollama(nl_query: str, system: str = _NL_SCHEMA) -> str:
     client = _ollama.Client(host=OLLAMA_HOST, timeout=20.0)
     resp = client.chat(
         model=SQL_MODEL,
         messages=[
-            {"role": "system", "content": _NL_SCHEMA},
+            {"role": "system", "content": system},
             {"role": "user", "content": nl_query},
         ],
     )
@@ -239,8 +245,80 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+# ---------------------------------------------------------------------------
+# Sidebar: bucket selector + prefix status
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("### Bucket")
+    try:
+        _buckets = [r[0] for r in get_conn().execute(
+            "SELECT bucket FROM scan_buckets ORDER BY bucket"
+        ).fetchall()]
+    except Exception:
+        _buckets = []
+
+    _bucket_options = ["(all)"] + _buckets
+    _selected_bucket = st.selectbox(
+        "Filter by bucket",
+        _bucket_options,
+        label_visibility="collapsed",
+        key="selected_bucket",
+    )
+
+    if _selected_bucket != "(all)":
+        st.caption(f"`s3://{_selected_bucket}`")
+        S3_BUCKET = _selected_bucket
+
+    st.write("")
+
+    _bucket_filter_sql = f"WHERE bucket = '{_selected_bucket}'" if _selected_bucket != "(all)" else ""
+
+    with st.expander("Prefix status", expanded=False):
+        try:
+            _prefix_df = get_conn().execute(f"""
+                SELECT prefix,
+                       CASE WHEN ignored THEN '⛔ ignored' ELSE '✓' END AS status,
+                       last_scanned_at,
+                       file_count
+                FROM scan_prefixes
+                {_bucket_filter_sql}
+                ORDER BY ignored DESC, prefix
+            """).df()
+            if _prefix_df.empty:
+                st.caption("No prefixes indexed yet. Run `make init` or `make inventory`.")
+            else:
+                st.dataframe(_prefix_df, use_container_width=True, hide_index=True)
+        except Exception as _e:
+            st.caption(f"Could not load prefix data: {_e}")
+
+    with st.expander("Unknown extensions", expanded=False):
+        try:
+            _unk_df = get_conn().execute(f"""
+                SELECT extension, count, example_key
+                FROM scan_unknown_extensions
+                {_bucket_filter_sql}
+                ORDER BY count DESC
+            """).df()
+            if _unk_df.empty:
+                st.caption("No unknown extensions found.")
+            else:
+                st.dataframe(_unk_df, use_container_width=True, hide_index=True)
+        except Exception:
+            st.caption("No unknown extension data yet.")
+
+# ---------------------------------------------------------------------------
+# Bucket filter clause injected into NL queries
+# ---------------------------------------------------------------------------
+_bucket_clause = (
+    f"AND f.bucket = '{_selected_bucket}' AND mm.bucket = '{_selected_bucket}'"
+    if _selected_bucket != "(all)"
+    else ""
+)
+
+_metrics_bucket_filter = f"WHERE f.bucket = '{_selected_bucket}'" if _selected_bucket != "(all)" else ""
+
 try:
-    _s = get_conn().execute("""
+    _s = get_conn().execute(f"""
         SELECT
             count(*) FILTER (WHERE f.media_type = 'video')           AS video_files,
             count(*) FILTER (WHERE f.media_type = 'audio')           AS audio_files,
@@ -248,6 +326,7 @@ try:
             sum(m.duration_s) FILTER (WHERE f.media_type = 'video')  AS video_s
         FROM media_files f
         LEFT JOIN media_metadata m USING (s3_key)
+        {_metrics_bucket_filter}
     """).fetchone()
     if _s and _s[0]:
         _h, _rem = divmod(int(_s[3] or 0), 3600)
@@ -400,7 +479,7 @@ if HAS_NL:
         if btn_col.button("Search", type="primary", use_container_width=True) and nl_query.strip():
             with st.spinner(f"Asking {_spinner_label}..."):
                 try:
-                    generated = _generate_sql(nl_query.strip())
+                    generated = _generate_sql(nl_query.strip(), _bucket_clause)
                     st.session_state["sql_area"] = generated
                     _run_sql(generated)
                 except Exception as e:
