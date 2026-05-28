@@ -468,27 +468,44 @@ def run_init_phase(s3_client, bucket: str, con: duckdb.DuckDBPyConnection) -> No
 # Phase 2 — metadata via ffprobe (+ optional mediainfo)
 # ---------------------------------------------------------------------------
 
-def _s3_client(profile: str | None):
+def _build_session(profile: str | None) -> boto3.Session:
+    """Return a boto3 Session for the given profile.
+
+    If the profile is configured with role_arn + source_profile in ~/.aws/config,
+    boto3 handles role assumption automatically — no extra code needed.
+
+    Typical MFA + role workflow (handled entirely outside the app):
+      1. Authenticate with MFA externally (e.g. aws sso login, or sts get-session-token)
+      2. Use a profile that has role_arn configured, e.g.:
+           AWS_PROFILE=enc-dev make inventory
+    """
+    return boto3.Session(profile_name=profile) if profile else boto3.Session()
+
+
+def _s3_client(profile: str | None, max_pool_connections: int = 50):
     """S3 client with SigV4 forced — required for presigned URLs with STS credentials."""
     from botocore.config import Config
-    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
-    return session.client("s3", config=Config(signature_version="s3v4"))
+    return _build_session(profile).client(
+        "s3",
+        config=Config(signature_version="s3v4", max_pool_connections=max_pool_connections),
+    )
 
 
 def _check_aws_auth(profile: str | None) -> None:
     """Fail fast with a clear message if AWS credentials are missing or expired."""
     try:
-        session = boto3.Session(profile_name=profile) if profile else boto3.Session()
-        identity = session.client("sts").get_caller_identity()
+        identity = _build_session(profile).client("sts").get_caller_identity()
         log.info("AWS auth OK — account=%s  arn=%s", identity["Account"], identity["Arn"])
     except Exception as exc:
         msg = str(exc)
         if "ExpiredToken" in msg or "expired" in msg.lower():
-            hint = "credentials have expired — refresh with: aws sso login"
+            hint = "credentials have expired — re-authenticate and retry"
         elif "NoCredentialProviders" in msg or "Unable to locate credentials" in msg:
-            hint = "no credentials found — run: aws configure  or set AWS_ACCESS_KEY_ID"
+            hint = "no credentials found — set AWS_PROFILE or AWS_ACCESS_KEY_ID"
+        elif "AccessDenied" in msg:
+            hint = f"access denied — check the profile has permission to assume the required role ({msg})"
         else:
-            hint = f"run: aws sts get-caller-identity  to debug ({msg})"
+            hint = f"run: aws sts get-caller-identity --profile <profile>  to debug ({msg})"
         raise SystemExit(f"ERROR: AWS auth failed — {hint}") from None
 
 
@@ -1379,7 +1396,9 @@ def main() -> None:
     parser.add_argument("--bucket", default="bitmovin-api-eu-west1-ci-input")
     parser.add_argument("--prefix", default="", help="Limit inventory to a specific S3 prefix")
     parser.add_argument("--db", default="content_catalogue.duckdb")
-    parser.add_argument("--profile", default=None, help="AWS profile name")
+    parser.add_argument("--profile", default=None,
+                        help="AWS profile from ~/.aws/config (e.g. enc-dev). "
+                             "If the profile has role_arn configured, boto3 assumes it automatically.")
     parser.add_argument("--workers", type=int, default=20, help="Parallel ffprobe workers")
     parser.add_argument(
         "--phase",
