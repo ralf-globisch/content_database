@@ -4,15 +4,13 @@ DB_FILE := /data/content_catalogue.duckdb
 BUCKET  := bitmovin-api-eu-west1-ci-input
 
 # AWS credentials — mounts ~/.aws so all credential types work (keys, assumed roles, SSO)
-# Override the profile with: export AWS_PROFILE=my-profile
+# For local runs, set the profile in your shell before running make:
+#   export AWS_PROFILE=enc-dev
+# On EC2, no profile is needed — the instance IAM role is used automatically.
 AWS_FLAGS := -v "$(HOME)/.aws:/root/.aws:ro" \
-	-e AWS_DEFAULT_REGION=$(or $(AWS_DEFAULT_REGION),eu-west-1)
-ifdef AWS_PROFILE
-AWS_FLAGS += -e AWS_PROFILE=$(AWS_PROFILE)
-PROFILE_ARG := --profile $(AWS_PROFILE)
-else
-PROFILE_ARG :=
-endif
+	-e AWS_DEFAULT_REGION=$(or $(AWS_DEFAULT_REGION),eu-west-1) \
+	$(if $(AWS_PROFILE),-e AWS_PROFILE=$(AWS_PROFILE),)
+PROFILE_ARG := $(if $(AWS_PROFILE),--profile $(AWS_PROFILE),)
 
 # Ollama — vision runs on host directly; UI passes these through for NL search in the browser
 OLLAMA_HOST         ?= http://localhost:11434
@@ -46,12 +44,11 @@ DOCKER_RUN := docker run --rm \
         db-pull db-push ec2-stop ec2-terminate
 
 check-auth:
-	@aws sts get-caller-identity > /dev/null || \
+	@aws sts get-caller-identity $(if $(AWS_PROFILE),--profile $(AWS_PROFILE),) > /dev/null || \
 		{ echo ""; \
-		  echo "ERROR: AWS credentials are missing or expired."; \
-		  echo "  For SSO:         aws sso login"; \
-		  echo "  For access keys: aws configure"; \
-		  echo "  For env vars:    export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=..."; \
+		  echo "ERROR: AWS credentials are missing or expired$(if $(AWS_PROFILE), for profile '$(AWS_PROFILE)',)."; \
+		  echo "  Re-authenticate with MFA externally, then retry."; \
+		  $(if $(AWS_PROFILE),echo "  Check: aws sts get-caller-identity --profile $(AWS_PROFILE)";,) \
 		  echo ""; exit 1; }
 
 ## Build the Docker image
@@ -176,12 +173,19 @@ unknown-extensions: $(DB_DIR)
 # ---------------------------------------------------------------------------
 # Cloud (EC2) targets — run the pipeline on a remote EC2 instance in eu-west-1
 # ---------------------------------------------------------------------------
-# Usage: EC2_HOST=ubuntu@1.2.3.4 make <target>
-# The remote instance must have Docker installed and /data on an EBS volume.
+# Uses SSM Session Manager — no key pair, no open SSH port, no public IP needed.
+# Add this to ~/.ssh/config so ssh/scp/rsync route through SSM automatically:
+#
+#   Host i-*
+#       User ubuntu
+#       ProxyCommand sh -c "aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters 'portNumber=%p'"
+#       StrictHostKeyChecking no
+#
+# Then set EC2_HOST to the instance ID (not an IP): EC2_HOST=i-0abc123 make <target>
 # Run  make ec2-setup  first to bootstrap a fresh instance.
 EC2_HOST     ?= $(error EC2_HOST is not set — use: EC2_HOST=ubuntu@<ip> make <target>)
 EC2_REPO_DIR ?= /opt/content-database
-EC2_DB_FILE  ?= /data/content_catalogue.duckdb
+EC2_DB_FILE  ?= $(EC2_REPO_DIR)/data/content_catalogue.duckdb
 
 ## Bootstrap a fresh EC2 instance (run once after launch)
 ec2-setup:
@@ -197,22 +201,22 @@ ec2-deploy:
 ## Run the interactive init wizard on EC2 (allocates a TTY)
 ## Usage: EC2_HOST=ubuntu@<ip> make cloud-init
 cloud-init: ec2-deploy
-	ssh -t $(EC2_HOST) "cd $(EC2_REPO_DIR) && make init BUCKET=$(BUCKET) $(if $(AWS_PROFILE),AWS_PROFILE=$(AWS_PROFILE),)"
+	ssh -t $(EC2_HOST) "cd $(EC2_REPO_DIR) && make init BUCKET=$(BUCKET)"
 
 ## Run inventory phase on EC2 (incremental — respects staleness)
 ## Usage: EC2_HOST=ubuntu@<ip> make cloud-inventory [ARGS="--staleness-days 0"]
 cloud-inventory: ec2-deploy
-	ssh $(EC2_HOST) "cd $(EC2_REPO_DIR) && make inventory BUCKET=$(BUCKET) ARGS='$(ARGS)' $(if $(AWS_PROFILE),AWS_PROFILE=$(AWS_PROFILE),)"
+	ssh $(EC2_HOST) "cd $(EC2_REPO_DIR) && make inventory BUCKET=$(BUCKET) ARGS='$(ARGS)'"
 
 ## Run metadata (ffprobe) phase on EC2
 ## Usage: EC2_HOST=ubuntu@<ip> make cloud-metadata [ARGS="--workers 40"]
 cloud-metadata: ec2-deploy
-	ssh $(EC2_HOST) "cd $(EC2_REPO_DIR) && make metadata BUCKET=$(BUCKET) ARGS='$(ARGS)' $(if $(AWS_PROFILE),AWS_PROFILE=$(AWS_PROFILE),)"
+	ssh $(EC2_HOST) "cd $(EC2_REPO_DIR) && make metadata BUCKET=$(BUCKET) ARGS='$(ARGS)'"
 
 ## Run inventory + metadata on EC2 (full pipeline, no vision)
 ## Usage: EC2_HOST=ubuntu@<ip> make cloud-run [ARGS="..."]
 cloud-run: ec2-deploy
-	ssh $(EC2_HOST) "cd $(EC2_REPO_DIR) && make both BUCKET=$(BUCKET) ARGS='$(ARGS)' $(if $(AWS_PROFILE),AWS_PROFILE=$(AWS_PROFILE),)"
+	ssh $(EC2_HOST) "cd $(EC2_REPO_DIR) && make both BUCKET=$(BUCKET) ARGS='$(ARGS)'"
 
 ## Sync the DuckDB file from EC2 to local data/ directory
 ## Usage: EC2_HOST=ubuntu@<ip> make db-pull
@@ -283,9 +287,11 @@ help:
 	@echo "  ARGS=\"--no-skip-stale\"                  Scan all non-ignored prefixes"
 	@echo "  ARGS=\"--force-prefix shows/\"            Force rescan of one prefix"
 	@echo ""
-	@echo "AWS credentials (pick one):"
-	@echo "  export AWS_PROFILE=my-profile"
+	@echo "AWS authentication (local):"
+	@echo "  export AWS_PROFILE=enc-dev                 Required for local runs — enc-dev profile"
+	@echo "                                             assumes the role via role_arn in ~/.aws/config"
 	@echo "  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=..."
+	@echo "  On EC2: no profile needed — instance IAM role is used automatically"
 	@echo ""
 	@echo "AI backend (pick one or both — Claude takes precedence when key is set):"
 	@echo "  export ANTHROPIC_API_KEY=sk-ant-...   # enables Claude backend"
