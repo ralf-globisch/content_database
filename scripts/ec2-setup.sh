@@ -7,11 +7,16 @@
 #   1. Launch an EC2 instance in eu-west-1 (Ubuntu 22.04 LTS recommended)
 #      - Attach an EBS volume at /dev/sdf (will be mounted at /data)
 #      - Recommended: t3.large (2 vCPU, 8 GB) spot instance
-#   2. Attach an IAM role with this policy:
-#        s3:ListBucket    on  arn:aws:s3:::bitmovin-api-eu-west1-ci-input
-#        s3:GetObject     on  arn:aws:s3:::bitmovin-api-eu-west1-ci-input/*
-#      No credentials files needed — the IAM role covers it.
-#   3. Security group: allow SSH inbound from your IP only.
+#      - No key pair needed; no inbound security group rules needed
+#   2. Attach an IAM role with:
+#        s3:ListBucket + s3:GetObject  on  arn:aws:s3:::bitmovin-api-eu-west1-ci-input
+#        AmazonSSMManagedInstanceCore  (managed policy — enables SSM Session Manager)
+#   3. Add to ~/.ssh/config on your local machine:
+#        Host i-*
+#            User ubuntu
+#            ProxyCommand sh -c "aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters 'portNumber=%p'"
+#            StrictHostKeyChecking no
+#   4. Run: make ec2-setup EC2_HOST=<instance-id>  (instance ID, not IP)
 
 set -euo pipefail
 
@@ -22,31 +27,45 @@ EBS_DEVICE=/dev/sdf   # adjust if AWS renames it to nvme1n1
 echo "==> Updating packages"
 sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
-    docker.io docker-compose-plugin \
-    awscli \
+    docker.io \
+    make \
     rsync \
     python3 python3-pip \
+    unzip \
     screen
+
+echo "==> Installing AWS CLI v2"
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp/
+sudo /tmp/aws/install --update
+rm -rf /tmp/awscliv2.zip /tmp/aws/
+
+echo "==> Installing Python dependencies"
+pip3 install --quiet boto3 duckdb
 
 # Allow ubuntu user to run docker without sudo
 sudo usermod -aG docker ubuntu
 
 echo "==> Formatting and mounting EBS volume at $DATA_DIR"
-# Check if device exists (AWS may rename to nvme format)
-if [ -b /dev/nvme1n1 ]; then
-    EBS_DEVICE=/dev/nvme1n1
-elif [ -b /dev/xvdf ]; then
-    EBS_DEVICE=/dev/xvdf
-fi
-
-if ! blkid "$EBS_DEVICE" | grep -q ext4; then
-    echo "  Formatting $EBS_DEVICE as ext4..."
-    sudo mkfs.ext4 -L content-db "$EBS_DEVICE"
-fi
-
 sudo mkdir -p "$DATA_DIR"
-if ! mountpoint -q "$DATA_DIR"; then
+
+if mountpoint -q "$DATA_DIR"; then
+    echo "  $DATA_DIR is already mounted, skipping format/mount."
+else
+    # Detect device name (AWS may use nvme or xvd naming)
+    if [ -b /dev/nvme1n1 ]; then
+        EBS_DEVICE=/dev/nvme1n1
+    elif [ -b /dev/xvdf ]; then
+        EBS_DEVICE=/dev/xvdf
+    fi
+
+    if ! blkid "$EBS_DEVICE" | grep -q ext4; then
+        echo "  Formatting $EBS_DEVICE as ext4..."
+        sudo mkfs.ext4 -L content-db "$EBS_DEVICE"
+    fi
+
     sudo mount "$EBS_DEVICE" "$DATA_DIR"
+    echo "  Mounted $EBS_DEVICE at $DATA_DIR"
 fi
 
 # Persist mount across reboots
