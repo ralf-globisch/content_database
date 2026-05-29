@@ -239,7 +239,7 @@ ifndef EC2_INSTANCE_ID
 endif
 	@echo "Pulling database before stopping instance..."
 	$(MAKE) db-pull
-	aws ec2 stop-instances --instance-ids $(EC2_INSTANCE_ID)
+	aws ec2 stop-instances --region eu-west-1 --instance-ids $(EC2_INSTANCE_ID)
 	@echo "Instance $(EC2_INSTANCE_ID) is stopping. EBS volume is preserved."
 	@echo "Restart later with: aws ec2 start-instances --instance-ids $(EC2_INSTANCE_ID)"
 
@@ -253,7 +253,7 @@ endif
 	@echo "WARNING: This permanently terminates $(EC2_INSTANCE_ID)."
 	@echo "Pulling database first..."
 	$(MAKE) db-pull
-	aws ec2 terminate-instances --instance-ids $(EC2_INSTANCE_ID)
+	aws ec2 terminate-instances --region eu-west-1 --instance-ids $(EC2_INSTANCE_ID)
 	@echo "Instance $(EC2_INSTANCE_ID) terminated."
 
 $(DB_DIR):
