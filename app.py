@@ -157,6 +157,150 @@ def get_conn():
     return duckdb.connect(DB_PATH, read_only=True)
 
 
+@st.cache_data(ttl=300)
+def _load_filter_options() -> dict:
+    try:
+        con = get_conn()
+        def _q(sql):
+            return [r[0] for r in con.execute(sql).fetchall() if r[0] is not None]
+        return {
+            "video_codecs":   _q("SELECT DISTINCT video_codec FROM media_metadata WHERE video_codec IS NOT NULL ORDER BY video_codec"),
+            "audio_codecs":   _q("SELECT DISTINCT audio_codec FROM media_metadata WHERE audio_codec IS NOT NULL ORDER BY audio_codec"),
+            "formats":        _q("SELECT DISTINCT format_name FROM media_metadata WHERE format_name IS NOT NULL ORDER BY format_name"),
+            "dolby_families": _q("SELECT DISTINCT dolby_codec_family FROM media_metadata WHERE dolby_codec_family IS NOT NULL ORDER BY dolby_codec_family"),
+            "languages":      _q("SELECT DISTINCT language FROM audio_tracks WHERE language IS NOT NULL ORDER BY language"),
+            "top_prefixes":   _q("SELECT DISTINCT top_prefix FROM media_files WHERE top_prefix IS NOT NULL AND top_prefix != '' ORDER BY top_prefix"),
+        }
+    except Exception:
+        return {"video_codecs": [], "audio_codecs": [], "formats": [],
+                "dolby_families": [], "languages": [], "top_prefixes": []}
+
+
+def _build_metadata_sql(filters: dict, selected_bucket: str) -> str:
+    conditions: list[str] = ["f.media_type = 'video'"]
+
+    # Only include successfully probed files unless the user explicitly asks for errors
+    if filters.get("errors", "(any)") == "With errors":
+        conditions.append("mm.error IS NOT NULL")
+    else:
+        conditions.append("mm.error IS NULL")
+
+    if selected_bucket != "(all)":
+        conditions.append(f"f.bucket = '{selected_bucket}'")
+
+    def _add(cond: str) -> None:
+        conditions.append(cond)
+
+    vc = filters.get("video_codec", "(any)")
+    if vc and vc != "(any)":
+        _add(f"mm.video_codec = '{vc}'")
+
+    res = filters.get("resolution", "(any)")
+    if res and res != "(any)":
+        _add({
+            "4K":    "mm.height >= 2160",
+            "1080p": "mm.height BETWEEN 1080 AND 2159",
+            "720p":  "mm.height BETWEEN 720 AND 1079",
+            "SD":    "mm.height < 720",
+        }[res])
+
+    fmt = filters.get("format_name", "(any)")
+    if fmt and fmt != "(any)":
+        _add(f"mm.format_name = '{fmt}'")
+
+    scan = filters.get("scan_type", "(any)")
+    if scan and scan != "(any)":
+        _add(f"mm.scan_type = '{scan}'")
+
+    hdr_list = filters.get("hdr_formats", [])
+    if hdr_list:
+        quoted = ", ".join(f"'{h}'" for h in hdr_list)
+        _add(f"coalesce(mm.hdr_format, 'SDR') IN ({quoted})")
+
+    dv = filters.get("dolby_vision", "Any")
+    if dv == "Yes":
+        _add("mm.dolby_vision = true")
+    elif dv == "No":
+        _add("(mm.dolby_vision IS NULL OR mm.dolby_vision = false)")
+
+    da = filters.get("dolby_atmos", "Any")
+    if da == "Yes":
+        _add("mm.dolby_atmos = true")
+    elif da == "No":
+        _add("(mm.dolby_atmos IS NULL OR mm.dolby_atmos = false)")
+
+    df_fam = filters.get("dolby_codec_family", "(any)")
+    if df_fam and df_fam != "(any)":
+        _add(f"mm.dolby_codec_family = '{df_fam}'")
+
+    if filters.get("min_bitrate"):
+        _add(f"mm.video_bitrate >= {int(filters['min_bitrate'])}")
+    if filters.get("max_bitrate"):
+        _add(f"mm.video_bitrate <= {int(filters['max_bitrate'])}")
+
+    if filters.get("min_duration"):
+        _add(f"mm.duration_s >= {float(filters['min_duration'])}")
+    if filters.get("max_duration"):
+        _add(f"mm.duration_s <= {float(filters['max_duration'])}")
+
+    if filters.get("min_size_mb"):
+        _add(f"f.size_bytes >= {int(filters['min_size_mb']) * 1_000_000}")
+    if filters.get("max_size_mb"):
+        _add(f"f.size_bytes <= {int(filters['max_size_mb']) * 1_000_000}")
+
+    if filters.get("min_height"):
+        _add(f"mm.height >= {int(filters['min_height'])}")
+    if filters.get("max_height"):
+        _add(f"mm.height <= {int(filters['max_height'])}")
+
+    ac = filters.get("audio_codec", "(any)")
+    if ac and ac != "(any)":
+        _add(f"mm.audio_codec = '{ac}'")
+
+    min_ch = filters.get("min_channels")
+    if min_ch and min_ch != "(any)":
+        _add(f"mm.audio_channels >= {int(min_ch)}")
+
+    lang = filters.get("language", "(any)")
+    if lang and lang != "(any)":
+        _add(f"EXISTS (SELECT 1 FROM audio_tracks atr WHERE atr.s3_key = f.s3_key AND atr.language = '{lang}')")
+
+    tp = filters.get("top_prefix", "(any)")
+    if tp and tp != "(any)":
+        _add(f"f.top_prefix = '{tp}'")
+
+    where = " AND ".join(conditions)
+    return f"""
+SELECT
+    f.bucket,
+    split_part(f.s3_key, '/', -1)           AS filename,
+    regexp_replace(f.s3_key, '/[^/]+$', '') AS folder,
+    f.s3_key,
+    round(f.size_bytes / 1e6, 1)            AS size_mb,
+    round(mm.duration_s, 1)                 AS duration_s,
+    mm.video_codec,
+    mm.width,
+    mm.height,
+    round(mm.fps::DOUBLE, 3)                AS fps,
+    mm.video_bitrate                        AS bitrate_kbps,
+    mm.hdr_format,
+    mm.dolby_vision,
+    mm.dv_profile,
+    mm.scan_type,
+    mm.format_name,
+    mm.audio_codec,
+    mm.audio_channels,
+    mm.dolby_atmos,
+    mm.dolby_codec_family,
+    mm.error
+FROM media_files f
+JOIN media_metadata mm USING (s3_key)
+WHERE {where}
+ORDER BY size_mb DESC
+LIMIT 1000
+"""
+
+
 st.set_page_config(page_title="BitQuery", layout="wide")
 
 st.markdown("""
@@ -648,6 +792,132 @@ if HAS_NL:
                     st.error(f"Search failed: {e}")
     st.write("")
 
+# --- Metadata filter search ---
+_ANY = "(any)"
+_MF_KEYS = [
+    "mf_video_codec", "mf_resolution", "mf_format_name", "mf_scan_type",
+    "mf_hdr_formats", "mf_dolby_vision", "mf_dolby_atmos", "mf_dolby_codec_family",
+    "mf_min_bitrate", "mf_max_bitrate", "mf_min_duration", "mf_max_duration",
+    "mf_min_size_mb", "mf_max_size_mb", "mf_min_height", "mf_max_height",
+    "mf_audio_codec", "mf_min_channels", "mf_language", "mf_top_prefix", "mf_errors",
+]
+
+with st.expander("Search via Metadata", expanded=False):
+    try:
+        _opts = _load_filter_options()
+    except Exception:
+        _opts = {"video_codecs": [], "audio_codecs": [], "formats": [],
+                 "dolby_families": [], "languages": [], "top_prefixes": []}
+
+    # Row 1 — Video identity
+    _r1a, _r1b, _r1c, _r1d = st.columns(4)
+    with _r1a:
+        st.selectbox("Video codec", [_ANY] + _opts["video_codecs"], key="mf_video_codec")
+    with _r1b:
+        st.selectbox("Resolution", [_ANY, "4K", "1080p", "720p", "SD"], key="mf_resolution")
+    with _r1c:
+        st.selectbox("Container", [_ANY] + _opts["formats"], key="mf_format_name")
+    with _r1d:
+        st.selectbox("Scan type", [_ANY, "progressive", "interlaced"], key="mf_scan_type")
+
+    # Row 2 — HDR & Dolby
+    _r2a, _r2b, _r2c, _r2d = st.columns(4)
+    with _r2a:
+        st.multiselect("HDR format", ["SDR", "HDR10", "HDR10+", "HLG", "Dolby Vision"],
+                       key="mf_hdr_formats")
+    with _r2b:
+        st.radio("Dolby Vision", ["Any", "Yes", "No"], horizontal=True, key="mf_dolby_vision")
+    with _r2c:
+        st.radio("Dolby Atmos", ["Any", "Yes", "No"], horizontal=True, key="mf_dolby_atmos")
+    with _r2d:
+        st.selectbox("Dolby family", [_ANY] + _opts["dolby_families"], key="mf_dolby_codec_family")
+
+    # Row 3 — Numeric ranges
+    _r3a, _r3b, _r3c, _r3d = st.columns(4)
+    with _r3a:
+        st.caption("Bitrate (kbps)")
+        _bc1, _bc2 = st.columns(2)
+        _bc1.number_input("Min", min_value=0, step=1000, value=0, key="mf_min_bitrate", label_visibility="collapsed")
+        _bc2.number_input("Max", min_value=0, step=1000, value=0, key="mf_max_bitrate", label_visibility="collapsed")
+        st.caption("↑ Min / Max  (0 = no limit)")
+    with _r3b:
+        st.caption("Duration (seconds)")
+        _dc1, _dc2 = st.columns(2)
+        _dc1.number_input("Min", min_value=0, step=60, value=0, key="mf_min_duration", label_visibility="collapsed")
+        _dc2.number_input("Max", min_value=0, step=60, value=0, key="mf_max_duration", label_visibility="collapsed")
+        st.caption("↑ Min / Max  (0 = no limit)")
+    with _r3c:
+        st.caption("File size (MB)")
+        _sc1, _sc2 = st.columns(2)
+        _sc1.number_input("Min", min_value=0, step=100, value=0, key="mf_min_size_mb", label_visibility="collapsed")
+        _sc2.number_input("Max", min_value=0, step=100, value=0, key="mf_max_size_mb", label_visibility="collapsed")
+        st.caption("↑ Min / Max  (0 = no limit)")
+    with _r3d:
+        st.caption("Height (px)")
+        _hc1, _hc2 = st.columns(2)
+        _hc1.number_input("Min", min_value=0, step=1, value=0, key="mf_min_height", label_visibility="collapsed")
+        _hc2.number_input("Max", min_value=0, step=1, value=0, key="mf_max_height", label_visibility="collapsed")
+        st.caption("↑ Min / Max  (0 = no limit)")
+
+    # Row 4 — Audio & Location
+    _r4a, _r4b, _r4c, _r4d = st.columns(4)
+    with _r4a:
+        st.selectbox("Audio codec", [_ANY] + _opts["audio_codecs"], key="mf_audio_codec")
+    with _r4b:
+        st.selectbox("Min audio channels", [_ANY, "1", "2", "6", "8", "16"], key="mf_min_channels")
+    with _r4c:
+        st.selectbox("Audio language", [_ANY] + _opts["languages"], key="mf_language")
+    with _r4d:
+        st.selectbox("Top prefix", [_ANY] + _opts["top_prefixes"], key="mf_top_prefix")
+
+    # Row 5 — Errors filter + actions
+    _r5a, _r5b, _r5c = st.columns([2, 1, 1])
+    with _r5a:
+        st.selectbox("Probe errors", [_ANY, "Without errors", "With errors"], key="mf_errors")
+    with _r5b:
+        st.write("")
+        if st.button("Search", type="primary", use_container_width=True, key="mf_search"):
+            _filters = {
+                "video_codec":       st.session_state.get("mf_video_codec", _ANY),
+                "resolution":        st.session_state.get("mf_resolution", _ANY),
+                "format_name":       st.session_state.get("mf_format_name", _ANY),
+                "scan_type":         st.session_state.get("mf_scan_type", _ANY),
+                "hdr_formats":       st.session_state.get("mf_hdr_formats", []),
+                "dolby_vision":      st.session_state.get("mf_dolby_vision", "Any"),
+                "dolby_atmos":       st.session_state.get("mf_dolby_atmos", "Any"),
+                "dolby_codec_family": st.session_state.get("mf_dolby_codec_family", _ANY),
+                "min_bitrate":       st.session_state.get("mf_min_bitrate") or 0,
+                "max_bitrate":       st.session_state.get("mf_max_bitrate") or 0,
+                "min_duration":      st.session_state.get("mf_min_duration") or 0,
+                "max_duration":      st.session_state.get("mf_max_duration") or 0,
+                "min_size_mb":       st.session_state.get("mf_min_size_mb") or 0,
+                "max_size_mb":       st.session_state.get("mf_max_size_mb") or 0,
+                "min_height":        st.session_state.get("mf_min_height") or 0,
+                "max_height":        st.session_state.get("mf_max_height") or 0,
+                "audio_codec":       st.session_state.get("mf_audio_codec", _ANY),
+                "min_channels":      st.session_state.get("mf_min_channels", _ANY),
+                "language":          st.session_state.get("mf_language", _ANY),
+                "top_prefix":        st.session_state.get("mf_top_prefix", _ANY),
+                "errors":            st.session_state.get("mf_errors", _ANY),
+            }
+            # Zero means "no limit" for numeric fields
+            for _k in ("min_bitrate", "max_bitrate", "min_duration", "max_duration",
+                       "min_size_mb", "max_size_mb", "min_height", "max_height"):
+                if _filters[_k] == 0:
+                    _filters[_k] = None
+            _sql = _build_metadata_sql(_filters, _selected_bucket)
+            st.session_state["sql_area"] = _sql.strip()
+            _run_sql(_sql)
+    with _r5c:
+        st.write("")
+        if st.button("Clear filters", use_container_width=True, key="mf_clear"):
+            for _k in _MF_KEYS:
+                if _k in st.session_state:
+                    del st.session_state[_k]
+            st.rerun()
+
+    st.caption("Video files only · up to 1,000 results · 0 in numeric fields = no limit · download CSV for full set")
+
 # --- Advanced: saved queries + SQL editor ---
 if "sql_area" not in st.session_state:
     st.session_state["sql_area"] = "SELECT * FROM media_files LIMIT 20"
@@ -710,9 +980,14 @@ if "df" in st.session_state:
 
     selected_rows = event.selection.rows
     if selected_rows and "s3_key" in page_df.columns:
-        cmds = "\n".join(
-            f"aws s3 cp s3://{S3_BUCKET}/{page_df.iloc[i]['s3_key']} ."
+        _has_bucket_col = "bucket" in page_df.columns
+        _uris = [
+            f"s3://{page_df.iloc[i]['bucket'] if _has_bucket_col else S3_BUCKET}/{page_df.iloc[i]['s3_key']}"
             for i in selected_rows
-        )
-        st.caption(f"{len(selected_rows)} file(s) selected — click the copy icon to copy the command(s):")
-        st.code(cmds, language="bash")
+        ]
+        st.caption(f"{len(selected_rows)} file(s) selected")
+        _uri_tab, _cmd_tab = st.tabs(["S3 URIs", "aws s3 cp commands"])
+        with _uri_tab:
+            st.code("\n".join(_uris), language="text")
+        with _cmd_tab:
+            st.code("\n".join(f"aws s3 cp {u} ." for u in _uris), language="bash")
