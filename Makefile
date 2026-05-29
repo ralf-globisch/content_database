@@ -230,18 +230,18 @@ db-push:
 	scp $(DB_DIR)/content_catalogue.duckdb $(EC2_HOST):$(EC2_DB_FILE)
 	@echo "Database pushed to $(EC2_HOST):$(EC2_DB_FILE)"
 
-## Stop the EC2 instance (EBS volume persists; instance can be restarted later)
-## Always run  make db-pull  first to save the database locally.
+## Terminate the spot instance (one-time spot instances cannot be stopped, only terminated).
+## DB is pulled first. To reuse the instance later, launch a new spot and push the DB back.
 ## Usage: EC2_INSTANCE_ID=i-0abc123 make ec2-stop
 ec2-stop:
 ifndef EC2_INSTANCE_ID
 	$(error EC2_INSTANCE_ID is not set — find it in the AWS console or: aws ec2 describe-instances --filters "Name=ip-address,Values=<ip>")
 endif
-	@echo "Pulling database before stopping instance..."
+	@echo "Pulling database before terminating spot instance..."
 	$(MAKE) db-pull
-	aws ec2 stop-instances --region eu-west-1 --instance-ids $(EC2_INSTANCE_ID)
-	@echo "Instance $(EC2_INSTANCE_ID) is stopping. EBS volume is preserved."
-	@echo "Restart later with: aws ec2 start-instances --instance-ids $(EC2_INSTANCE_ID)"
+	aws ec2 terminate-instances --region eu-west-1 --instance-ids $(EC2_INSTANCE_ID)
+	@echo "Spot instance $(EC2_INSTANCE_ID) is terminating."
+	@echo "To resume later: launch a new spot instance and run: make ec2-setup ec2-deploy db-push"
 
 ## Terminate the EC2 instance permanently (destroys instance; EBS deleted unless configured otherwise)
 ## Always run  make db-pull  first. This cannot be undone.
