@@ -234,27 +234,27 @@ db-push:
 ## Terminate the spot instance (one-time spot instances cannot be stopped, only terminated).
 ## DB is pulled first. To reuse the instance later, launch a new spot and push the DB back.
 ## Usage: EC2_INSTANCE_ID=i-0abc123 make ec2-stop
-ec2-stop:
+ec2-stop: check-auth
 ifndef EC2_INSTANCE_ID
 	$(error EC2_INSTANCE_ID is not set — find it in the AWS console or: aws ec2 describe-instances --filters "Name=ip-address,Values=<ip>")
 endif
 	@echo "Pulling database before terminating spot instance..."
 	$(MAKE) db-pull
-	aws ec2 terminate-instances $(if $(AWS_PROFILE),--profile $(AWS_PROFILE),) --region $(EC2_REGION) --instance-ids $(EC2_INSTANCE_ID)
+	aws ec2 terminate-instances $(PROFILE_ARG) --region $(EC2_REGION) --instance-ids $(EC2_INSTANCE_ID)
 	@echo "Spot instance $(EC2_INSTANCE_ID) is terminating."
 	@echo "To resume later: launch a new spot instance and run: make ec2-setup ec2-deploy db-push"
 
 ## Terminate the EC2 instance permanently (destroys instance; EBS deleted unless configured otherwise)
 ## Always run  make db-pull  first. This cannot be undone.
 ## Usage: EC2_INSTANCE_ID=i-0abc123 make ec2-terminate
-ec2-terminate:
+ec2-terminate: check-auth
 ifndef EC2_INSTANCE_ID
 	$(error EC2_INSTANCE_ID is not set — find it in the AWS console or: aws ec2 describe-instances --filters "Name=ip-address,Values=<ip>")
 endif
 	@echo "WARNING: This permanently terminates $(EC2_INSTANCE_ID)."
 	@echo "Pulling database first..."
 	$(MAKE) db-pull
-	aws ec2 terminate-instances $(if $(AWS_PROFILE),--profile $(AWS_PROFILE),) --region $(EC2_REGION) --instance-ids $(EC2_INSTANCE_ID)
+	aws ec2 terminate-instances $(PROFILE_ARG) --region $(EC2_REGION) --instance-ids $(EC2_INSTANCE_ID)
 	@echo "Instance $(EC2_INSTANCE_ID) terminated."
 
 $(DB_DIR):
