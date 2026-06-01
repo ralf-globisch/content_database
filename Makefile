@@ -240,7 +240,7 @@ ifndef EC2_INSTANCE_ID
 endif
 	@echo "Pulling database before terminating spot instance..."
 	$(MAKE) db-pull
-	aws ec2 terminate-instances --region $(EC2_REGION) --instance-ids $(EC2_INSTANCE_ID)
+	aws ec2 terminate-instances $(if $(AWS_PROFILE),--profile $(AWS_PROFILE),) --region $(EC2_REGION) --instance-ids $(EC2_INSTANCE_ID)
 	@echo "Spot instance $(EC2_INSTANCE_ID) is terminating."
 	@echo "To resume later: launch a new spot instance and run: make ec2-setup ec2-deploy db-push"
 
@@ -254,7 +254,7 @@ endif
 	@echo "WARNING: This permanently terminates $(EC2_INSTANCE_ID)."
 	@echo "Pulling database first..."
 	$(MAKE) db-pull
-	aws ec2 terminate-instances --region $(EC2_REGION) --instance-ids $(EC2_INSTANCE_ID)
+	aws ec2 terminate-instances $(if $(AWS_PROFILE),--profile $(AWS_PROFILE),) --region $(EC2_REGION) --instance-ids $(EC2_INSTANCE_ID)
 	@echo "Instance $(EC2_INSTANCE_ID) terminated."
 
 $(DB_DIR):
